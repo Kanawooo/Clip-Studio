@@ -18,7 +18,7 @@ its attribution in `.pi/skills/hyperframes/talking-head-recut/NOTICE.md`.
 
 | Component | Pinned version | License/source |
 | --- | --- | --- |
-| `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` | 0.84.2 | MIT, https://github.com/earendil-works/pi |
+| `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` | 0.84.4 | MIT, https://github.com/earendil-works/pi |
 | `hyperframes` | 0.8.4 | Apache-2.0, https://github.com/heygen-com/hyperframes |
 | `@modelcontextprotocol/sdk` | 1.30.0 | MIT, package `LICENSE` |
 
