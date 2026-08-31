@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "product": "Clip Studio",
+  "version": "0.1.0",
+  "platform": "win32-x64",
+  "buildId": "mtgoezku",
+  "generatedAt": "2026-08-31T03:52:36.7745190Z",
+  "artifacts": [
+    {
+      "path": "dist/api/app.js",
+      "bytes": 7837,
+      "sha256": "6eb59ed8c3716deb6cccac40d54976b1f88bf3160d214806d9d76bafe4b68e8a"
+    },
+    {
+      "path": "dist/api/local-state.js",
+      "bytes": 11017,
+      "sha256": "35f7f1a36e3d1d8c7a75a39f991dae597c4e68778286571d474862448b0c5b61"
+    },
+    {
+      "path": "dist/api/media.js",
+      "bytes": 3300,
+      "sha256": "7c1e87f5f93e439bbfead44613b865b929813c6530737b4c8b836ef8bf0935ec"
+    },
+    {
+      "path": "dist/api/model-capabilities.js",
+      "bytes": 5881,
+      "sha256": "6721b16c978bee795dcf802d7fc7045a47d77f1151a27277e177922e8fa7c85a"
+    },
+    {
+      "path": "dist/api/model-capability-store.js",
+      "bytes": 5106,
+      "sha256": "c116cdabfe50a4f07e8426b7fda95e4d118ddd89dc58dc4d73e95fe63328c32d"
+    },
+    {
+      "path": "dist/api/model-catalog.js",
+      "bytes": 3360,
+      "sha256": "0ccdf5c287e9f69b342d8a90fd31f5f7a4b13bf2fa14f1661bcc99b4c87e967b"
+    },
+    {
+      "path": "dist/api/models.js",
+      "bytes": 4661,
+      "sha256": "2df610980a22e6f3994bd2c0ad2c2de23d17c550c1c31c4280185ed6c9932ae5"
+    },
+    {
+      "path": "dist/api/sse.js",
+      "bytes": 1903,
+      "sha256": "71a1d64ab3d270bb1281330a872cf784ba5a1d8d27a5eb50300c7b46e0180936"
+    },
+    {
+      "path": "dist/api/static.js",
+      "bytes": 3275,
+      "sha256": "4995186703e69d96c7c605ea7a36f21ef2f2e05336d205ddaeb4b3f63bc25dc5"
+    },
+    {
+      "path": "dist/api/system.js",
+      "bytes": 17937,
+      "sha256": "7e835eda9e7ec6c466b0ff88f84d3fc9e51424bc4632929ed6c8b4e222feb4c2"
+    },
+    {
+      "path": "dist/api/tasks.js",
+      "bytes": 9587,
+      "sha256": "f5a0f4cde285e90d0e15a3ad5755b5878120cc22f0bc3c8f7e9cfc9d09fe2d5d"
+    },
+    {
+      "path": "dist/index.js",
+      "bytes": 4721,
+      "sha256": "c49d0e728cb0da6dfef064bc5f4c50b03a1a70829d5af31beafdec22d4f47c6f"
+    },
+    {
+      "path": "dist/model-catalog.json",
+      "bytes": 279586,
+      "sha256": "43a042fca038fb77dfcb694cdc94f81c8687397d9e88c3a575c9ff6f9af712d2"
+    },
+    {
+      "path": "dist/pi/access-policy.js",
+      "bytes": 2649,
+      "sha256": "6366f23161a89db60e49947e315aca2cef771fbf545cb22f91e748e5c451286a"
+    },
+    {
+      "path": "dist/pi/model-discovery.js",
+      "bytes": 6064,
+      "sha256": "10a45e6d76dc7118d6d61fec49050075490cb15c97daf8bc2e99a918546ab73a"
+    },
+    {
+      "path": "dist/pi/model.js",
+      "bytes": 15580,
+      "sha256": "399fe09ca75095b489f5b8020e973bc35683904769e82d3df3d35385b6c85b78"
+    },
+    {
+      "path": "dist/pi/prompt.js",
+      "bytes": 1646,
+      "sha256": "b818dff2cb996c45e352f073afe6c32cce79fc01c26dbe1376b3b7bb29b662f1"
+    },
+    {
+      "path": "dist/pi/session.js",
+      "bytes": 2572,
+      "sha256": "25e84d084db5dd06c6dee477119f43c0a827e91be5888138b930fcf1e2ef411c"
+    },
+    {
+      "path": "dist/pi/skills.js",
+      "bytes": 3130,
+      "sha256": "6fba71d0ab07833805906cc711beab0ce420c38f180f5a0abfba5bcf6275db8a"
+    },
+    {
+      "path": "dist/pi/thinking-capabilities.js",
+      "bytes": 3341,
+      "sha256": "01cbed37de406f30b43ae632fbcbf713fe9db0c0d300780b8de5a72691e55162"
+    },
+    {
+      "path": "dist/security.js",
+      "bytes": 369,
+      "sha256": "f493b09fd2df685a621f065725a27f4638166f72575842497ce2c4c477bee70c"
+    },
+    {
+      "path": "dist/tasks/manager.js",
+      "bytes": 14601,
+      "sha256": "4853440ca0bb407c6157eab3f62d9d5d6ace45dfdb6398a243935f0ecd3ef147"
+    },
+    {
+      "path": "dist/tasks/outputs.js",
+      "bytes": 5816,
+      "sha256": "78b6077ca044a853108c6651d80024feb1997ee904c61b373e524f7613ee0dfb"
+    },
+    {
+      "path": "dist/tasks/types.js",
+      "bytes": 346,
+      "sha256": "3289b0cd3801a8d691f44689f36ba33f84e52f23cf6d9ab377b86f375be22359"
+    },
+    {
+      "path": "web/dist/assets/index-CMHUPYtf.js",
+      "bytes": 248371,
+      "sha256": "d7feff31bcde8b0e4c95cf955a4ff0fc42f460ebf07d1f9555462363f850cb4c"
+    },
+    {
+      "path": "web/dist/assets/index-Dx_zuVHU.css",
+      "bytes": 17138,
+      "sha256": "bde3f8b5c643ac65ca6a123f66b1211c8bdd69fdc636ee9810e98ece9b2c3ad4"
+    },
+    {
+      "path": "web/dist/build-id.txt",
+      "bytes": 9,
+      "sha256": "7c229a568ff50344ec08beb1e4ec61addfff62ae2a7121f5a9e8ccd5939e49ed"
+    },
+    {
+      "path": "web/dist/index.html",
+      "bytes": 785,
+      "sha256": "81e0badc0f2b4bce3b8aee68327f5ef15aea0f75f07161f3fe918ede66c4283a"
+    }
+  ]
+}
