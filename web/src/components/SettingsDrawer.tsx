@@ -347,7 +347,7 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
             <div className="model-recommendation"><Eye size={18} /><span><strong>仅支持多模态主模型</strong><small>主模型需要直接理解参考画面和素材，并完成剪辑判断。</small></span></div>
 
             <div className="model-source-switch" role="group" aria-label="模型来源">
-              <button type="button" className={draft.modelSource === "builtin" ? "active" : ""} aria-pressed={draft.modelSource === "builtin"} onClick={() => changeModelSource("builtin")}>内置模型</button>
+              <button type="button" className={draft.modelSource === "builtin" ? "active" : ""} aria-pressed={draft.modelSource === "builtin"} onClick={() => changeModelSource("builtin")}>内置服务商</button>
               <button type="button" className={draft.modelSource === "custom" ? "active" : ""} aria-pressed={draft.modelSource === "custom"} onClick={() => changeModelSource("custom")}>自定义服务</button>
             </div>
 
@@ -403,7 +403,7 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
                       setModelListOpen(false);
                     }
                   }}
-                  placeholder={draft.modelSource === "builtin" ? "搜索内置模型" : "可以手动填写或获取后搜索"}
+                  placeholder={draft.modelSource === "builtin" ? "搜索模型" : "可以手动填写或获取后搜索"}
                   autoComplete="off"
                 />
                 <button className="combobox-toggle" type="button" aria-label="展开模型列表" onClick={() => { setFilterModels(false); setActiveModelIndex(0); setModelListOpen((value) => !value); }}><ChevronDown size={16} /></button>
@@ -420,10 +420,10 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
                       onMouseEnter={() => setActiveModelIndex(index)}
                       onClick={() => { updateModelIdentity("model", item.id); setModelListOpen(false); }}
                     ><strong>{item.id}</strong>{item.name !== item.id ? <small>{item.name}</small> : null}</button>
-                  )) : <p>{draft.modelSource === "builtin" ? "没有匹配的内置模型" : "没有匹配模型，可继续手动填写"}</p>}
+                  )) : <p>{draft.modelSource === "builtin" ? "没有匹配的模型" : "没有匹配模型，可继续手动填写"}</p>}
                 </div>
               ) : null}
-              <span className="settings-help">{draft.modelSource === "builtin" ? "从项目内 Pi 模型目录中选择。" : "点击“获取模型”时，密钥只用于读取当前服务的模型列表。"}</span>
+              <span className="settings-help">{draft.modelSource === "builtin" ? "服务商、接口地址和模型能力来自项目内 Pi 目录。" : "点击“获取模型”时，密钥只用于读取当前服务的模型列表。"}</span>
             </div>
             <div className="field-group thinking-level-field">
               <label htmlFor="thinking-level">思考强度</label>

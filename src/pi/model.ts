@@ -1,6 +1,7 @@
 import {
   InMemoryCredentialStore,
   clampThinkingLevel,
+  getSupportedThinkingLevels,
   type ModelThinkingLevel as PiModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { completeSimple, type Model } from "@earendil-works/pi-ai/compat";
@@ -247,8 +248,6 @@ async function testVisionCapability(
 export function thinkingCapabilityFromModel(
   model: Model<any>,
 ): ModelConnectionTestResult["thinking"] {
-  const official = officialThinkingCapabilityView(model.id);
-  if (official) return official;
   if (!model.reasoning) {
     return {
       status: "unsupported",
@@ -257,15 +256,7 @@ export function thinkingCapabilityFromModel(
       message: "该模型未提供可调思考强度",
     };
   }
-  if (!isCompleteThinkingLevelMap(model.thinkingLevelMap)) {
-    return {
-      status: "unverified",
-      levels: [],
-      source: "unverified",
-      message: "模型目录未提供完整思考档位，未自动猜测",
-    };
-  }
-  const levels = normalizeThinkingLevels(MODEL_THINKING_LEVELS.filter((level) => model.thinkingLevelMap?.[level] !== null));
+  const levels = normalizeThinkingLevels(getSupportedThinkingLevels(model));
   if (!levels.some((level) => level !== "off")) {
     return {
       status: "unsupported",
@@ -278,8 +269,8 @@ export function thinkingCapabilityFromModel(
     status: "supported",
     levels,
     source: "pi-explicit",
-    message: `Pi 模型目录明确提供 ${levels.length} 个思考档位`,
-    levelMap: { ...model.thinkingLevelMap },
+    message: `Pi 模型目录提供 ${levels.length} 个思考档位`,
+    ...(model.thinkingLevelMap ? { levelMap: { ...model.thinkingLevelMap } } : {}),
   };
 }
 
@@ -375,12 +366,6 @@ function taskThinkingLevel(config: ModelConfig, model: Model<any>): ModelThinkin
     : config.thinkingLevel;
   if (!requested) return undefined;
   return clampThinkingLevel(model, requested as PiModelThinkingLevel) as ModelThinkingLevel;
-}
-
-function isCompleteThinkingLevelMap(
-  levelMap: ModelThinkingLevelMap | undefined,
-): levelMap is Required<ModelThinkingLevelMap> {
-  return Boolean(levelMap && MODEL_THINKING_LEVELS.every((level) => Object.hasOwn(levelMap, level)));
 }
 
 const VISION_PROBE_ATTEMPTS = [
