@@ -17,11 +17,11 @@ Clip Studio 是一个本地视频制作入口。填写参考视频、素材目�
 
 Clip Studio 支持 Windows 10 和 Windows 11 x64。首次安装使用 HTTPS 网络下载固定版本的本地运行组件。视频制作期间连接用户配置的模型服务。
 
-## 安装与启动
+## 普通用户安装
 
-将完整目录解压到英文路径，例如 `D:\Clip Studio`，然后双击 [start.bat](start.bat)。安装目录允许空格。参考视频、素材、音频和输出路径支持中文与空格。
+前往 [GitHub Releases](https://github.com/Kanawooo/Clip-Studio/releases) 下载 `Clip-Studio-Windows-x64.zip`。将完整目录解压到英文路径，例如 `D:\Clip Studio`，然后双击 [start.bat](start.bat)。安装目录允许空格。参考视频、素材、音频和输出路径支持中文与空格。
 
-首次启动会自动运行 [install.bat](install.bat)，安装并验证以下组件：
+首次启动自动运行 [install.bat](install.bat)，安装并验证以下组件：
 
 - Node.js 与锁定的 Pi、HyperFrames 生产依赖
 - FFmpeg 与 FFprobe
@@ -31,6 +31,20 @@ Clip Studio 支持 Windows 10 和 Windows 11 x64。首次安装使用 HTTPS 网�
 - Chrome Headless Shell
 
 运行组件保存在 `.runtime/`。生产发行包已经包含后端和前端构建结果。环境验证完成后，服务会打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。
+
+## 源码开发
+
+源码仓库包含后端、前端、ClipSkills、HyperFrames 技能源码以及安装、构建和发行脚本。开发环境需要 Node.js 22.19.0 或更高版本。
+
+```powershell
+git clone https://github.com/Kanawooo/Clip-Studio.git
+cd Clip-Studio
+npm ci
+npm --prefix web ci
+npm run build
+```
+
+开发模式使用 `npm run dev`。构建结果生成在 `dist/` 和 `web/dist/`。运行 `npm run package:release` 可生成 Windows 发行包。
 
 ## 模型设置
 

@@ -1,0 +1,13 @@
+# Preserve upstream skill bytes and the documented local distribution changes
+# without EOL or whitespace normalization.
+.pi/skills/clip-skills/** -text
+.pi/skills/hyperframes/** -text
+.pi/skills/SOURCES.md -text
+
+# Development-only material is omitted from source export archives.
+/tests/** export-ignore
+/docs/** export-ignore
+/AGENTS.md export-ignore
+**/*.test.* export-ignore
+**/*.spec.* export-ignore
+**/test-corpus/** export-ignore
