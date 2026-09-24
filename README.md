@@ -15,13 +15,13 @@ Clip Studio 是一个本地视频制作入口。填写参考视频、素材目�
 
 ## 系统要求
 
-Clip Studio 支持 Windows 10 和 Windows 11 x64。首次安装使用 HTTPS 网络下载固定版本的本地运行组件。视频制作期间连接用户配置的模型服务。
+Clip Studio 支持 Windows 10 和 Windows 11 x64。首次启动检查程序目录与本机已有的运行组件，复用通过兼容性验证的组件，并下载缺失部分。视频制作期间连接用户配置的模型服务。
 
 ## 普通用户安装
 
 前往 [GitHub Releases](https://github.com/Kanawooo/Clip-Studio/releases) 下载 `Clip-Studio-Windows-x64.zip`。将完整目录解压到英文路径，例如 `D:\Clip Studio`，然后双击 [start.bat](start.bat)。安装目录允许空格。参考视频、素材、音频和输出路径支持中文与空格。
 
-首次启动自动运行 [install.bat](install.bat)，安装并验证以下组件：
+首次启动按需运行 [install.bat](install.bat)，检查并准备以下组件：
 
 - Node.js 与锁定的 Pi、HyperFrames 生产依赖
 - FFmpeg 与 FFprobe
@@ -30,7 +30,7 @@ Clip Studio 支持 Windows 10 和 Windows 11 x64。首次安装使用 HTTPS 网�
 - whisper.cpp 与 `small.en` 模型
 - Chrome Headless Shell
 
-运行组件保存在 `.runtime/`。生产发行包已经包含后端和前端构建结果。环境验证完成后，服务会打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。
+已有的本机程序以原路径供 Clip Studio 使用；新下载的组件和项目专用依赖保存在 `.runtime/` 与项目目录。可验证的同件镜像优先用于缺失组件，镜像不可用时使用官方来源；下载文件继续按 SHA-256 或依赖锁文件校验。FFmpeg 缺失时使用 BtbN 最新 Release，后续启动复用安装记录。生产发行包已经包含后端和前端构建结果。环境验证完成后，服务会打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。
 
 ## 源码开发
 
@@ -67,7 +67,7 @@ Pi 在当前 Session 中选择任务需要的 ClipSkills 和 HyperFrames skill�
 
 | 路径 | 内容 |
 | --- | --- |
-| `.runtime/` | 本地运行组件、安装状态、加密设置和服务日志 |
+| `.runtime/` | 下载的运行组件、安装状态、项目 Python 环境、加密设置和服务日志 |
 | `.runtime/whisper/models/` | Whisper `small.en` 模型 |
 | `data/tasks/` | 任务状态、Pi Session 和任务工作区 |
 | 用户选择的输出目录 | 最终成片 |

@@ -44,8 +44,48 @@ $ReleaseManifest = $null
 $WhisperRoot = Join-Path $RuntimeRoot "whisper"
 $WhisperModelRoot = Join-Path $WhisperRoot "models"
 $WhisperModelPath = Join-Path $WhisperModelRoot "ggml-$($Manifest.WhisperModel).bin"
+$PythonBaseExe = $null
 
 . $RuntimeStateScript
+
+function Test-NodeVersion([string]$Value) {
+  try { return [version]$Value.TrimStart('v') -ge [version]"22.19.0" } catch { return $false }
+}
+
+function Test-UvVersion([string]$Value) {
+  if ($Value -notmatch '^uv (\d+\.\d+\.\d+)') { return $false }
+  try { return [version]$Matches[1] -ge [version]$Manifest.UvVersion } catch { return $false }
+}
+
+function Set-RuntimePathsFromState {
+  $names = @(
+    @("node", "NodeExe", "node.exe"),
+    @("npm", "NpmCommand", "npm.cmd"),
+    @("ffmpeg", "FfmpegExe", "ffmpeg.exe"),
+    @("ffprobe", "FfprobeExe", "ffprobe.exe"),
+    @("git", "GitExe", "git.exe"),
+    @("bash", "BashExe", "bash.exe"),
+    @("uv", "UvExe", "uv.exe"),
+    @("uvx", "UvxExe", "uvx.exe"),
+    @("python", "PythonExe", "python.exe"),
+    @("python3", "Python3Exe", "python3.exe"),
+    @("browser", "BrowserExe", "chrome-headless-shell.exe"),
+    @("whisper", "WhisperExe", "whisper-cli.exe")
+  )
+  foreach ($entry in $names) {
+    $record = Get-StateRecord $State.runtimeFiles $entry[0]
+    if (-not $record) { throw "Runtime file record is missing: $($entry[0])" }
+    Set-Variable -Name $entry[1] -Value (Resolve-RuntimeFilePath -RuntimeRoot $RuntimeRoot -Record $record -ExpectedName $entry[2]) -Scope Script
+  }
+  $baseRecord = Get-StateRecord $State.runtimeFiles "pythonBase"
+  if ($baseRecord) {
+    $script:PythonBaseExe = Resolve-RuntimeFilePath -RuntimeRoot $RuntimeRoot -Record $baseRecord -ExpectedName "python.exe"
+  }
+  if ($State.whisperModel -and $State.whisperModel.path) {
+    $script:WhisperModelPath = Resolve-RuntimeFilePath -RuntimeRoot $RuntimeRoot -Record $State.whisperModel -ExpectedName "ggml-$($Manifest.WhisperModel).bin"
+  }
+  $script:WhisperModelRoot = Split-Path $WhisperModelPath
+}
 
 function Test-Executable([string]$Path, [string[]]$Arguments) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
@@ -96,18 +136,6 @@ function Get-Sha256([string]$Path) {
     $algorithm.Dispose()
     $stream.Dispose()
   }
-}
-
-function Resolve-RuntimePath([string]$RelativePath) {
-  if ([string]::IsNullOrWhiteSpace($RelativePath) -or [IO.Path]::IsPathRooted($RelativePath)) {
-    throw "Invalid runtime-relative path"
-  }
-  $root = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\') + '\'
-  $full = [IO.Path]::GetFullPath((Join-Path $RuntimeRoot $RelativePath.Replace('/', '\')))
-  if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Runtime path is outside the project"
-  }
-  return $full
 }
 
 function Get-StateRecord($Container, [string]$Name) {
@@ -161,50 +189,68 @@ function Add-FastRuntimeChecks {
       }
     }
     if ($State.hyperframesVersion -ne $Manifest.HyperFramesVersion -or
-        $State.whisperVersion -ne $Manifest.WhisperVersion -or
         $State.puppeteerPatchVersion -ne $Manifest.PuppeteerPatchVersion) {
       $Problems.Add("Project media runtime versions have changed")
     }
-    if ([string]$State.nodeVersion -notmatch "^v?$([regex]::Escape($Manifest.NodeVersion))$") { $Problems.Add("Project-local Node.js version has changed") }
-    if ([string]$State.ffmpegVersion -notmatch "ffmpeg version n?$([regex]::Escape($Manifest.FfmpegVersion))") { $Problems.Add("Project-local FFmpeg version has changed") }
-    if ([string]$State.gitVersion -notmatch [regex]::Escape($Manifest.GitVersion.Substring(0, $Manifest.GitVersion.LastIndexOf('.')))) { $Problems.Add("Project-local Git version has changed") }
-    if ([string]$State.uvVersion -notmatch "uv $([regex]::Escape($Manifest.UvVersion))(\s|$)") { $Problems.Add("Project-local uv version has changed") }
-    if ([string]$State.pythonVersion -ne $Manifest.PythonVersion) { $Problems.Add("Project-local Python version has changed") }
-    if ([string]$State.browserVersion -notmatch [regex]::Escape($Manifest.ChromeVersion)) { $Problems.Add("Project-local rendering browser version has changed") }
+    if (-not (Test-NodeVersion ([string]$State.nodeVersion))) { $Problems.Add("Node.js version is incompatible") }
+    if ([string]::IsNullOrWhiteSpace([string]$State.ffmpegVersion)) { $Problems.Add("FFmpeg version record is missing") }
+    if ([string]$State.gitVersion -notmatch '^git version ') { $Problems.Add("Git version record is invalid") }
+    if (-not (Test-UvVersion ([string]$State.uvVersion))) { $Problems.Add("uv version is incompatible") }
+    if ([string]$State.pythonVersion -notmatch '^3\.12\.\d+$') { $Problems.Add("Python version is incompatible") }
+    if ([string]$State.browserVersion -notmatch [regex]::Escape($Manifest.ChromeVersion)) { $Problems.Add("Rendering browser version has changed") }
+    if ([string]$State.whisperVersion -ne $Manifest.WhisperVersion -and [string]$State.whisperVersion -ne "system") {
+      $Problems.Add("Whisper runtime version record is invalid")
+    }
 
-    $script:BrowserExe = Resolve-RuntimePath ([string]$State.browserRelativePath)
-    $script:WhisperExe = Resolve-RuntimePath ([string]$State.whisperRelativePath)
     if ($null -eq $State.runtimeFiles) {
       $Problems.Add("Project runtime file record is missing")
       return
     }
+    Set-RuntimePathsFromState
     $specs = @(
-      @("node", $NodeExe, $Manifest.NodeVersion),
-      @("npm", $NpmCommand, $Manifest.NodeVersion),
-      @("ffmpeg", $FfmpegExe, $Manifest.FfmpegVersion),
-      @("ffprobe", $FfprobeExe, $Manifest.FfmpegVersion),
-      @("git", $GitExe, $Manifest.GitVersion),
-      @("bash", $BashExe, $Manifest.GitVersion),
-      @("uv", $UvExe, $Manifest.UvVersion),
-      @("uvx", $UvxExe, $Manifest.UvVersion),
-      @("python", $PythonExe, $Manifest.PythonVersion),
-      @("python3", $Python3Exe, $Manifest.PythonVersion),
-      @("browser", $BrowserExe, $Manifest.ChromeVersion),
-      @("whisper", $WhisperExe, $Manifest.WhisperVersion)
+      @("node", $NodeExe),
+      @("npm", $NpmCommand),
+      @("ffmpeg", $FfmpegExe),
+      @("ffprobe", $FfprobeExe),
+      @("git", $GitExe),
+      @("bash", $BashExe),
+      @("uv", $UvExe),
+      @("uvx", $UvxExe),
+      @("python", $PythonExe),
+      @("python3", $Python3Exe),
+      @("browser", $BrowserExe),
+      @("whisper", $WhisperExe)
     )
     foreach ($spec in $specs) {
-      $problem = Test-RuntimeFileMetadata -RuntimeRoot $RuntimeRoot -Record (Get-StateRecord $State.runtimeFiles $spec[0]) -ExpectedPath $spec[1] -ExpectedVersion $spec[2]
+      $record = Get-StateRecord $State.runtimeFiles $spec[0]
+      $problem = Test-RuntimeFileMetadata -RuntimeRoot $RuntimeRoot -Record $record -ExpectedPath $spec[1] -ExpectedVersion ([string]$record.version)
       if ($problem) { $Problems.Add("$($spec[0]) $problem") }
+    }
+    $nodeRecord = Get-StateRecord $State.runtimeFiles "node"
+    if ($nodeRecord -and [string]$nodeRecord.source -eq "system") {
+      if (-not (Test-Executable $NodeExe @("--version")) -or (& $NodeExe --version).Trim() -ne [string]$State.nodeVersion) {
+        $Problems.Add("System Node.js has changed")
+      }
+    }
+    $baseRecord = Get-StateRecord $State.runtimeFiles "pythonBase"
+    if ($baseRecord) {
+      $problem = Test-RuntimeFileMetadata -RuntimeRoot $RuntimeRoot -Record $baseRecord -ExpectedPath $PythonBaseExe -ExpectedVersion ([string]$baseRecord.version)
+      if ($problem) { $Problems.Add("pythonBase $problem") }
     }
     $modelRecord = Get-StateRecord $State "whisperModel"
     if ($null -eq $modelRecord -or -not (Test-Path -LiteralPath $WhisperModelPath -PathType Leaf)) {
       $Problems.Add("Project Whisper model is missing; run install.bat to prepare it")
     } else {
       $modelFile = Get-Item -LiteralPath $WhisperModelPath
+      $modelRecordTime = if ($modelRecord.lastWriteTimeUtc -is [datetime]) {
+        [datetime]$modelRecord.lastWriteTimeUtc
+      } else {
+        [datetime]::Parse([string]$modelRecord.lastWriteTimeUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+      }
       if ([string]$modelRecord.version -ne $Manifest.WhisperModel -or
           [string]$modelRecord.sha256 -ne $Manifest.WhisperModelSha256 -or
           [Int64]$modelRecord.size -ne [Int64]$modelFile.Length -or
-          [string]$modelRecord.lastWriteTimeUtc -ne $modelFile.LastWriteTimeUtc.ToString("o")) {
+          $modelRecordTime.ToUniversalTime().Ticks -ne $modelFile.LastWriteTimeUtc.Ticks) {
         $Problems.Add("Project Whisper model has changed")
       }
     }
@@ -219,31 +265,32 @@ function Add-FastRuntimeChecks {
 function Invoke-FullRuntimeDiagnostic([bool]$ApplyPatch) {
   $diagnostics = [Collections.Generic.List[string]]::new()
   if (-not (Test-Executable $NodeExe @("--version"))) {
-    $diagnostics.Add("Project-local Node.js is missing or cannot run")
+    $diagnostics.Add("Node.js is missing or cannot run")
   } else {
     $version = (& $NodeExe --version).Trim().TrimStart('v')
-    if ($version -ne $Manifest.NodeVersion) { $diagnostics.Add("Project-local Node.js version does not match the runtime manifest") }
+    if (-not (Test-NodeVersion $version)) { $diagnostics.Add("Node.js version is incompatible") }
   }
-  if (-not (Test-Executable $FfmpegExe @("-version"))) { $diagnostics.Add("Project-local FFmpeg is missing or cannot run") }
-  if (-not (Test-Executable $FfprobeExe @("-version"))) { $diagnostics.Add("Project-local FFprobe is missing or cannot run") }
-  if (-not (Test-Executable $GitExe @("--version"))) { $diagnostics.Add("Project-local Git is missing or cannot run") }
-  if (-not (Test-Executable $BashExe @("--version"))) { $diagnostics.Add("Project-local Bash is missing or cannot run") }
-  if (-not (Test-Executable $UvExe @("--version"))) { $diagnostics.Add("Project-local uv is missing or cannot run") }
-  if (-not (Test-Executable $UvxExe @("--version"))) { $diagnostics.Add("Project-local uvx is missing or cannot run") }
+  if (-not (Test-Executable $FfmpegExe @("-version"))) { $diagnostics.Add("FFmpeg is missing or cannot run") }
+  if (-not (Test-Executable $FfprobeExe @("-version"))) { $diagnostics.Add("FFprobe is missing or cannot run") }
+  if (-not (Test-Executable $GitExe @("--version"))) { $diagnostics.Add("Git is missing or cannot run") }
+  if (-not (Test-Executable $BashExe @("-lc", "true"))) { $diagnostics.Add("Git Bash is missing or cannot run") }
+  if (-not (Test-Executable $UvExe @("--version"))) { $diagnostics.Add("uv is missing or cannot run") }
+  if (-not (Test-Executable $UvxExe @("--version"))) { $diagnostics.Add("uvx is missing or cannot run") }
   if (-not (Test-Executable $PythonExe @("--version")) -or -not (Test-Executable $Python3Exe @("--version"))) {
-    $diagnostics.Add("Project-local Python is missing or cannot run")
+    $diagnostics.Add("Project Python environment is missing or cannot run")
   } else {
     try {
       $pythonVersion = (& $PythonExe -c "import platform; print(platform.python_version())").Trim()
-      if ($pythonVersion -ne $Manifest.PythonVersion) { $diagnostics.Add("Project-local Python version does not match the runtime manifest") }
+      if ($pythonVersion -notmatch '^3\.12\.\d+$') { $diagnostics.Add("Python version is incompatible") }
       & $PythonExe -c "import librosa, numpy, soundfile" 2>$null
-      if ($LASTEXITCODE -ne 0) { $diagnostics.Add("Project-local Python media packages are incomplete") }
+      if ($LASTEXITCODE -ne 0) { $diagnostics.Add("Project Python media packages are incomplete") }
     } catch {
-      $diagnostics.Add("Project-local Python media packages are incomplete")
+      $diagnostics.Add("Project Python media packages are incomplete")
     }
   }
-  if (-not $BrowserExe -or -not (Test-Executable $BrowserExe @("--version"))) { $diagnostics.Add("Project-local rendering browser is missing or cannot run") }
-  if (-not $WhisperExe -or -not (Test-Executable $WhisperExe @("--help"))) { $diagnostics.Add("Project-local transcription runtime is missing or cannot run") }
+  if ($PythonBaseExe -and -not (Test-Executable $PythonBaseExe @("--version"))) { $diagnostics.Add("Python base interpreter is missing or cannot run") }
+  if (-not $BrowserExe -or -not (Test-Executable $BrowserExe @("--version"))) { $diagnostics.Add("Rendering browser is missing or cannot run") }
+  if (-not $WhisperExe -or -not (Test-Executable $WhisperExe @("--help"))) { $diagnostics.Add("Transcription runtime is missing or cannot run") }
   if (-not (Test-Path -LiteralPath $WhisperModelPath -PathType Leaf)) {
     $diagnostics.Add("Project Whisper model is missing; run install.bat to prepare it")
   } else {
@@ -338,10 +385,14 @@ if ([string]::IsNullOrWhiteSpace($env:PRODUCER_MAX_WORKERS)) {
 }
 $env:DO_NOT_TRACK = "1"
 $env:PI_VIDEO_SHELL_PATH = $BashExe
-$gitBin = Join-Path $GitRoot "bin"
-$gitCmd = Join-Path $GitRoot "cmd"
-$gitUsrBin = Join-Path $GitRoot "usr\bin"
-$env:PATH = "$NodeRoot;$PythonScripts;$UvRoot;$RuntimeBin;$FfmpegBin;$gitCmd;$gitBin;$gitUsrBin;$(Join-Path $ProjectRoot 'node_modules\.bin');$env:PATH"
+$nodeBin = Split-Path $NodeExe
+$pythonScripts = Split-Path $PythonExe
+$uvBin = Split-Path $UvExe
+$ffmpegBin = Split-Path $FfmpegExe
+$gitCmd = Split-Path $GitExe
+$gitBin = Split-Path $BashExe
+$gitUsrBin = Join-Path (Split-Path $gitCmd) "usr\bin"
+$env:PATH = "$nodeBin;$pythonScripts;$uvBin;$RuntimeBin;$ffmpegBin;$gitCmd;$gitBin;$gitUsrBin;$(Join-Path $ProjectRoot 'node_modules\.bin');$env:PATH"
 $env:PI_VIDEO_STARTUP_ID = $StartupId
 $env:PI_VIDEO_RUNTIME_VERIFIED = "1"
 

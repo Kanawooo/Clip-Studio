@@ -33,7 +33,7 @@ their binaries are not committed to this repository.
 | Component | Installed version | License/source |
 | --- | --- | --- |
 | Node.js | 22.23.2 | Node.js license and bundled third-party notices, https://github.com/nodejs/node |
-| FFmpeg and FFprobe | 8.1.2-50-g1a748fe2cd GPL shared build | GPL-compatible build with GPL dependencies, including libx264/libx265; FFmpeg license details: https://ffmpeg.org/legal.html; build source: https://github.com/BtbN/FFmpeg-Builds |
+| FFmpeg and FFprobe | BtbN latest FFmpeg master GPL shared build for Windows x64 | GPL-compatible build with GPL dependencies, including libx264/libx265; FFmpeg license details: https://ffmpeg.org/legal.html; build source: https://github.com/BtbN/FFmpeg-Builds |
 | PortableGit / Git for Windows | 2.55.0.5 | Git GPL-2.0 and component-specific licenses, https://gitforwindows.org/ |
 | uv / uvx | 0.12.5 | MIT OR Apache-2.0, https://github.com/astral-sh/uv |
 | CPython runtime | 3.12.12 | Python Software Foundation License, https://www.python.org/psf/license/ |

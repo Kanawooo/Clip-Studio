@@ -7,19 +7,50 @@ function Get-RuntimeFileMetadata {
 
   $runtime = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\') + '\'
   $full = [IO.Path]::GetFullPath($Path)
-  if (-not $full.StartsWith($runtime, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Runtime file is outside the project: $full"
-  }
   $file = Get-Item -LiteralPath $full -ErrorAction Stop
   if (-not $file.PSIsContainer -and $file.Length -ge 0) {
-    return [ordered]@{
-      path = $full.Substring($runtime.Length).Replace('\', '/')
+    $projectFile = $full.StartsWith($runtime, [StringComparison]::OrdinalIgnoreCase)
+    $record = [ordered]@{
+      path = if ($projectFile) { $full.Substring($runtime.Length).Replace('\', '/') } else { $full }
       size = [Int64]$file.Length
       lastWriteTimeUtc = $file.LastWriteTimeUtc.ToString("o")
       version = $Version
     }
+    if (-not $projectFile) { $record.source = "system" }
+    return $record
   }
   throw "Runtime file is not a regular file: $full"
+}
+
+function Resolve-RuntimeFilePath {
+  param(
+    [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+    [Parameter(Mandatory = $true)]$Record,
+    [string]$ExpectedName = ""
+  )
+
+  $recordPath = [string]$Record.path
+  $source = [string]$Record.source
+  if ([string]::IsNullOrWhiteSpace($recordPath)) { throw "Runtime path is missing" }
+  if ($source -eq "system") {
+    if ($recordPath -notmatch '^[A-Za-z]:[\\/]' -or $recordPath.StartsWith('\\')) {
+      throw "System runtime path is invalid"
+    }
+    $full = [IO.Path]::GetFullPath($recordPath)
+  } elseif ([string]::IsNullOrEmpty($source) -or $source -eq "project") {
+    if ([IO.Path]::IsPathRooted($recordPath)) { throw "Project runtime path is invalid" }
+    $runtime = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\') + '\'
+    $full = [IO.Path]::GetFullPath((Join-Path $RuntimeRoot $recordPath.Replace('/', '\')))
+    if (-not $full.StartsWith($runtime, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "Project runtime path is outside the project"
+    }
+  } else {
+    throw "Runtime source is invalid"
+  }
+  if ($ExpectedName -and -not [string]::Equals([IO.Path]::GetFileName($full), $ExpectedName, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Runtime filename is invalid"
+  }
+  return $full
 }
 
 function Test-RuntimeFileMetadata {
@@ -32,23 +63,20 @@ function Test-RuntimeFileMetadata {
 
   try {
     if ($null -eq $Record) { return "installation record is missing" }
-    $runtime = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\') + '\'
-    $recordPath = [string]$Record.path
-    if ([string]::IsNullOrWhiteSpace($recordPath) -or [IO.Path]::IsPathRooted($recordPath)) {
-      return "installation path is invalid"
-    }
-    $recordFull = [IO.Path]::GetFullPath((Join-Path $RuntimeRoot $recordPath.Replace('/', '\')))
-    if (-not $recordFull.StartsWith($runtime, [StringComparison]::OrdinalIgnoreCase)) {
-      return "installation path is outside the project"
-    }
     $expectedFull = [IO.Path]::GetFullPath($ExpectedPath)
+    $recordFull = Resolve-RuntimeFilePath -RuntimeRoot $RuntimeRoot -Record $Record -ExpectedName ([IO.Path]::GetFileName($expectedFull))
     if (-not [string]::Equals($recordFull, $expectedFull, [StringComparison]::OrdinalIgnoreCase)) {
       return "installation path has changed"
     }
     $file = Get-Item -LiteralPath $recordFull -ErrorAction Stop
     if ($file.PSIsContainer) { return "runtime file is missing" }
     if ([Int64]$Record.size -ne [Int64]$file.Length) { return "runtime file size has changed" }
-    if ([string]$Record.lastWriteTimeUtc -ne $file.LastWriteTimeUtc.ToString("o")) {
+    $recordTime = if ($Record.lastWriteTimeUtc -is [datetime]) {
+      [datetime]$Record.lastWriteTimeUtc
+    } else {
+      [datetime]::Parse([string]$Record.lastWriteTimeUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    if ($recordTime.ToUniversalTime().Ticks -ne $file.LastWriteTimeUtc.Ticks) {
       return "runtime file modification time has changed"
     }
     if ([string]$Record.version -ne $ExpectedVersion) { return "runtime version has changed" }

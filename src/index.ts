@@ -11,6 +11,12 @@ async function main(): Promise<void> {
   initializeEnvironment();
   console.log("[clip-studio] loading local service modules");
   const { createApp } = await import("./api/app.js");
+  const { warmPathPicker, stopPathPicker } = await import("./api/system.js");
+  process.once("exit", stopPathPicker);
+  const pickerWarmup = warmPathPicker().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[clip-studio] path picker warmup failed: ${message}`);
+  });
   const { loadModelCatalog } = await import("./api/model-catalog.js");
   const { ModelCapabilityRegistry } = await import("./api/model-capabilities.js");
   await fs.mkdir(path.join(dataDir, "pi"), { recursive: true });
@@ -38,6 +44,8 @@ async function main(): Promise<void> {
     modelCapabilities,
   });
 
+  await pickerWarmup;
+
   server.listen(port, host, () => {
     console.log(`[clip-studio] listening on http://${host}:${port}`);
     console.log(`[clip-studio] projectRoot: ${projectRoot}`);
@@ -46,6 +54,7 @@ async function main(): Promise<void> {
 
   const shutdown = (signal: string) => {
     console.log(`[clip-studio] ${signal} received, shutting down`);
+    stopPathPicker();
     server.close(() => {
       void taskManager.shutdown().finally(() => process.exit(0));
     });

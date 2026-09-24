@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
@@ -153,10 +153,7 @@ export async function handleDialogPick(
       : "Video Files|*.mp4;*.mov;*.webm;*.mkv|All Files|*.*";
     const initialPath = resolvePickerInitialPath(type, raw.initialPath);
 
-    const command = type === "directory"
-      ? buildDirectoryPickerScript(title, initialPath)
-      : buildFilePickerScript(title, filter, initialPath);
-    const result = await runPowerShellPicker(req, command);
+    const result = await getPickerWorker().pick(res, { type, title, filter, initialPath });
     if (!result) {
       sendJson(res, 200, { path: null, cancelled: true });
       return;
@@ -175,34 +172,141 @@ export async function handleDialogPick(
   }
 }
 
-function runPowerShellPicker(req: IncomingMessage, command: string): Promise<string | null> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "powershell.exe",
-      pickerPowerShellArgs(command),
-      { windowsHide: true, stdio: ["ignore", "pipe", "ignore"], env: pickerEnvironment() },
-    );
-    let stdout = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      const result = parsePickerOutput(stdout);
-      if (result.type === "picked") resolve(result.path);
-      else if (result.type === "cancelled") resolve(null);
-      else if (result.type === "error") reject(new Error(`无法打开系统选择窗口：${result.message}`));
-      else reject(new Error(code === 0 ? "系统选择窗口没有返回结果" : "系统选择窗口启动失败"));
+interface PickerRequest {
+  type: "file" | "directory";
+  title: string;
+  filter: string;
+  initialPath?: string;
+}
+
+interface PendingPicker {
+  res: ServerResponse;
+  onClose: () => void;
+  resolve: (path: string | null) => void;
+  reject: (error: Error) => void;
+}
+
+let pickerWorker: PickerWorker | null = null;
+
+export async function warmPathPicker(): Promise<void> {
+  await getPickerWorker().ready;
+}
+
+export function stopPathPicker(): void {
+  pickerWorker?.stop();
+}
+
+function getPickerWorker(): PickerWorker {
+  pickerWorker ??= new PickerWorker();
+  return pickerWorker;
+}
+
+class PickerWorker {
+  readonly ready: Promise<void>;
+  private readonly child: ChildProcessWithoutNullStreams;
+  private resolveReady!: () => void;
+  private rejectReady!: (error: Error) => void;
+  private startupTimer: NodeJS.Timeout | null = null;
+  private stdout = "";
+  private stderr = "";
+  private pending: PendingPicker | null = null;
+  private initialized = false;
+  private closed = false;
+
+  constructor() {
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
     });
-    req.once("aborted", () => child.kill());
-  });
-}
+    this.child = spawn("powershell.exe", pickerPowerShellArgs(buildWindowsPickerWorkerScript()), {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: pickerEnvironment(),
+    });
+    this.child.stdout.setEncoding("utf8");
+    this.child.stderr.setEncoding("utf8");
+    this.child.stdout.on("data", (chunk: string) => this.receive(chunk));
+    this.child.stderr.on("data", (chunk: string) => { this.stderr = (this.stderr + chunk).slice(-2_000); });
+    this.child.stdin.on("error", (error) => this.fail(error));
+    this.child.once("error", (error) => this.fail(error));
+    this.child.once("close", (code) => this.fail(new Error(
+      compactPickerError(this.stderr) || `系统选择窗口进程已退出（${code ?? "未知"}）`,
+    )));
+    this.startupTimer = setTimeout(() => this.fail(new Error("系统选择窗口预热超时")), 12_000);
+    this.startupTimer.unref?.();
+  }
 
-export function buildDirectoryPickerScript(title: string, initialPath?: string): string {
-  return buildWindowsPickerScript("directory", title, "", initialPath);
-}
+  async pick(res: ServerResponse, request: PickerRequest): Promise<string | null> {
+    await this.ready;
+    if (this.closed) throw new Error("系统选择窗口未运行");
+    if (this.pending) throw new HttpError(409, "已有路径选择窗口打开");
+    if (res.destroyed) throw new Error("路径选择请求已取消");
+    return new Promise<string | null>((resolve, reject) => {
+      const onClose = () => this.fail(new Error("路径选择请求已取消"));
+      this.pending = { res, onClose, resolve, reject };
+      res.once("close", onClose);
+      const encoded = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
+      try {
+        this.child.stdin.write(`${encoded}\n`, "utf8", (error) => { if (error) this.fail(error); });
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
 
-export function buildFilePickerScript(title: string, filter: string, initialPath?: string): string {
-  return buildWindowsPickerScript("file", title, filter, initialPath);
+  stop(): void {
+    this.fail(new Error("系统选择窗口已关闭"));
+  }
+
+  private receive(chunk: string): void {
+    this.stdout += chunk;
+    if (this.stdout.length > 128_000) return this.fail(new Error("系统选择窗口输出过长"));
+    let newline: number;
+    while ((newline = this.stdout.indexOf("\n")) >= 0) {
+      const line = this.stdout.slice(0, newline).trim();
+      this.stdout = this.stdout.slice(newline + 1);
+      if (line) this.receiveLine(line);
+    }
+  }
+
+  private receiveLine(line: string): void {
+    if (!this.initialized) {
+      if (line === "READY") {
+        this.initialized = true;
+        if (this.startupTimer) clearTimeout(this.startupTimer);
+        this.startupTimer = null;
+        this.resolveReady();
+      } else {
+        const result = parsePickerOutput(line);
+        this.fail(new Error(result.type === "error" ? result.message : "系统选择窗口预热失败"));
+      }
+      return;
+    }
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = null;
+    pending.res.off("close", pending.onClose);
+    const result = parsePickerOutput(line);
+    if (result.type === "picked") pending.resolve(result.path);
+    else if (result.type === "cancelled") pending.resolve(null);
+    else if (result.type === "error") pending.reject(new Error(`无法打开系统选择窗口：${result.message}`));
+    else pending.reject(new Error("系统选择窗口没有返回结果"));
+  }
+
+  private fail(error: Error): void {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.startupTimer) clearTimeout(this.startupTimer);
+    if (pickerWorker === this) pickerWorker = null;
+    if (!this.initialized) this.rejectReady(error);
+    if (this.pending) {
+      const pending = this.pending;
+      this.pending = null;
+      pending.res.off("close", pending.onClose);
+      pending.reject(error);
+    }
+    this.child.kill();
+  }
 }
 
 export function pickerPowerShellArgs(command: string): string[] {
@@ -229,12 +333,7 @@ export function parsePickerOutput(output: string): PickerOutput {
   return { type: "invalid" };
 }
 
-function buildWindowsPickerScript(
-  type: "file" | "directory",
-  title: string,
-  filter: string,
-  initialPath?: string,
-): string {
+function buildWindowsPickerWorkerScript(): string {
   return `
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -244,21 +343,32 @@ try {
   Add-Type -TypeDefinition @'
 ${WINDOWS_PICKER_INTEROP_SOURCE}
 '@
-  $title = ${powerShellUtf8Value(title)}
-  $filter = ${powerShellUtf8Value(filter)}
-  $initialPath = ${initialPath ? powerShellUtf8Value(initialPath) : "$null"}
-  $result = [ClipStudio.NativePathPicker]::Pick('${type}', $title, $filter, $initialPath)
-  if ($null -eq $result) {
-    Write-Output 'CANCELLED'
-  } else {
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($result))
-    Write-Output "PICKED:$encoded"
-  }
+  [Console]::Out.WriteLine('READY')
+  [Console]::Out.Flush()
 } catch {
   $message = $_.Exception.GetBaseException().Message
   $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($message))
-  Write-Output "PICKER_ERROR:$encoded"
+  [Console]::Out.WriteLine("PICKER_ERROR:$encoded")
+  [Console]::Out.Flush()
   exit 41
+}
+while ($null -ne ($line = [Console]::ReadLine())) {
+  try {
+    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line))
+    $request = ConvertFrom-Json -InputObject $json
+    $result = [ClipStudio.NativePathPicker]::Pick([string]$request.type, [string]$request.title, [string]$request.filter, [string]$request.initialPath)
+    if ($null -eq $result) {
+      [Console]::Out.WriteLine('CANCELLED')
+    } else {
+      $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($result))
+      [Console]::Out.WriteLine("PICKED:$encoded")
+    }
+  } catch {
+    $message = $_.Exception.GetBaseException().Message
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($message))
+    [Console]::Out.WriteLine("PICKER_ERROR:$encoded")
+  }
+  [Console]::Out.Flush()
 }
 `.trim();
 }
@@ -284,11 +394,6 @@ function pickerEnvironment(): NodeJS.ProcessEnv {
     environment.HOME = userProfile;
   }
   return environment;
-}
-
-function powerShellUtf8Value(value: string): string {
-  const encoded = Buffer.from(value, "utf8").toString("base64");
-  return `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))`;
 }
 
 function decodePickerValue(value: string): string | null {
