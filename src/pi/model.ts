@@ -6,6 +6,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { completeSimple, type Model } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { redactSecrets } from "../security.js";
 import {
   MODEL_THINKING_LEVELS,
   type ModelConfig,
@@ -320,7 +321,7 @@ async function testVisionCapability(
         },
       );
       if (visualResponse.stopReason === "error") {
-        return visionResultFromError(visualResponse.errorMessage || "图片请求失败");
+        return visionResultFromError(redactSecrets(visualResponse.errorMessage || "图片请求失败", [config.apiKey]));
       } else if (signal.aborted || visualResponse.stopReason === "aborted") {
         return inconclusive("图片能力测试超时，请重新测试");
       } else {
@@ -333,7 +334,7 @@ async function testVisionCapability(
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return visionResultFromError(message);
+      return visionResultFromError(redactSecrets(message, [config.apiKey]));
     }
 
     if (lastResult.vision.status !== "inconclusive") {
@@ -611,7 +612,7 @@ export function visionResultFromResponse(
 export function visionResultFromError(message: string): Pick<ModelConnectionTestResult, "vision"> {
   const unsupported = /(image|vision).{0,80}(not supported|unsupported)|does not support.{0,40}(image|vision)|unsupported.{0,40}(image|vision)|(?:不支持|无法处理).{0,30}(?:图片|图像|视觉)|(?:图片|图像|视觉).{0,30}(?:不支持|无法处理)/i.test(message);
   if (unsupported) {
-    return { vision: { status: "unsupported", message: "服务明确表示该模型不支持图片输入" } };
+    return { vision: { status: "unsupported", message: `服务明确拒绝图片输入：${safeVisionPreview(message)}` } };
   }
   if (/(?:\b429\b|rate.?limit|too many requests|限流|请求过多)/i.test(message)) {
     return inconclusive("图片能力测试受到限流，请稍后重试");
@@ -619,7 +620,7 @@ export function visionResultFromError(message: string): Pick<ModelConnectionTest
   if (/(?:time.?out|timed out|超时)/i.test(message)) {
     return inconclusive("图片能力测试超时，请重新测试");
   }
-  return inconclusive("图片请求失败，暂时无法确认模型图片能力");
+  return inconclusive(`图片请求失败，暂时无法确认模型图片能力：${safeVisionPreview(message)}`);
 }
 
 function isVerifiedVisionAnswer(text: string): boolean {

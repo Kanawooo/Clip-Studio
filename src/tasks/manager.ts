@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { modelConfigFingerprint } from "../api/model-capabilities.js";
 import { SseHub } from "../api/sse.js";
-import { buildResumePrompt, buildTaskPrompt } from "../pi/prompt.js";
+import { buildResumePrompt, buildTaskPrompt, type TaskExecutionPaths } from "../pi/prompt.js";
 import { errorMessage, redactSecrets } from "../security.js";
 import {
   diffVideoOutputs,
@@ -65,6 +65,8 @@ export interface TaskManagerOptions {
   outputScanIntervalMs?: number;
 }
 
+const MAX_FAILURE_RECOVERY_INSPECTIONS = 12;
+
 /**
  * Minimal task lifecycle around one native Pi Session.
  * Pi owns every video decision and command; the manager owns state, SSE and
@@ -106,12 +108,37 @@ export class TaskManager {
         catch { pi = await createPiVideoSession(sessionOptions); }
       } else pi = await createPiVideoSession(sessionOptions);
       let lastToolFailure: string | undefined;
+      let recoveryFailure: string | undefined;
+      let recoveryInspections = 0;
+      let recovering = false;
+      let abortingRecoveryLoop = false;
+      const toolArgs = new Map<string, unknown>();
       const unsubscribe = pi.session.subscribe((event) => {
-        if (event.type !== "tool_execution_end" || !event.isError) return;
+        if (event.type === "tool_execution_start") {
+          toolArgs.set(event.toolCallId, event.args);
+          return;
+        }
+        if (event.type !== "tool_execution_end") return;
+        const args = toolArgs.get(event.toolCallId);
+        toolArgs.delete(event.toolCallId);
         const content = Array.isArray(event.result?.content) ? event.result.content : [];
         const detail = content.filter((item: { type?: string; text?: string }) => item.type === "text")
           .map((item: { text?: string }) => item.text ?? "").join(" ").trim();
-        lastToolFailure = `${event.toolName} 执行失败${detail ? `：${detail.slice(-1_500)}` : "（工具未提供详细原因）"}`;
+        if (event.isError) {
+          lastToolFailure = `${event.toolName} 执行失败${detail ? `：${detail.slice(-1_500)}` : "（工具未提供详细原因）"}`;
+          recovering = true;
+          recoveryInspections += 1;
+        } else if (recovering && isDiagnosticInspection(event.toolName, args)) {
+          recoveryInspections += 1;
+        } else if (recovering) {
+          recovering = false;
+          recoveryInspections = 0;
+        }
+        if (!abortingRecoveryLoop && recovering && recoveryInspections >= MAX_FAILURE_RECOVERY_INSPECTIONS) {
+          abortingRecoveryLoop = true;
+          recoveryFailure = `检测到工具失败后连续 ${recoveryInspections} 次仅排查而未继续制作，已停止以避免循环。最近错误：${lastToolFailure ?? "工具未提供详细原因"}`;
+          void pi.session.abort().catch(() => undefined);
+        }
       });
       return {
         prompt: async (text) => {
@@ -120,12 +147,13 @@ export class TaskManager {
           if (lastAssistant?.stopReason === "error") {
             throw new Error(lastAssistant.errorMessage || "Pi 模型请求失败");
           }
-          if (pi.getFailure()) throw new Error(pi.getFailure());
+          const failure = recoveryFailure || pi.getFailure();
+          if (failure) throw new Error(failure);
         },
         abort: () => pi.session.abort(),
         dispose: async () => { unsubscribe(); await pi.dispose(); },
         thinkingLevel: pi.thinkingLevel,
-        getFailure: () => pi.getFailure() || lastToolFailure,
+        getFailure: () => recoveryFailure || pi.getFailure() || lastToolFailure,
         get sessionFile() { return pi.session.sessionManager.getSessionFile(); },
         restoredSession,
       };
@@ -216,7 +244,7 @@ export class TaskManager {
     this.broadcastTask(runtime);
 
     try {
-      await this.startAttempt(runtime, input, buildTaskPrompt(input));
+      await this.startAttempt(runtime, input, buildTaskPrompt(input, this.executionPaths(runtime)));
       return task;
     } catch (error) {
       const message = this.safeError(runtime, error);
@@ -274,7 +302,12 @@ export class TaskManager {
     this.broadcastTask(runtime);
     try {
       await this.startAttempt(runtime, input,
-        (restored) => buildResumePrompt(input, restored, runtime.task.outputs.map((item) => item.path)), resumeSessionFile);
+        (restored) => buildResumePrompt(
+          input,
+          restored,
+          runtime.task.outputs.map((item) => item.path),
+          this.executionPaths(runtime),
+        ), resumeSessionFile);
       return runtime.task;
     } catch (error) {
       const message = this.safeError(runtime, error);
@@ -576,6 +609,15 @@ export class TaskManager {
     this.admissionReserved = true;
   }
 
+  private executionPaths(runtime: TaskRuntime): TaskExecutionPaths {
+    const portable = (value: string) => path.resolve(value).replace(/\\/g, "/");
+    return {
+      workspace: portable(runtime.workspace),
+      mediaCacheScript: portable(path.join(this.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs")),
+      renderQueueScript: portable(path.join(this.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
+    };
+  }
+
   private safeError(runtime: TaskRuntime, error: unknown): string {
     return sanitizePublicText(redactSecrets(errorMessage(error), runtime.secrets));
   }
@@ -599,6 +641,17 @@ function isActive(status: TaskStatus): boolean {
 function normalizePathKey(value: string): string {
   const resolved = path.resolve(value);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isDiagnosticInspection(toolName: string, args: unknown): boolean {
+  if (toolName === "read" || toolName === "grep" || toolName === "find" || toolName === "ls") return true;
+  if (toolName !== "bash" || !args || typeof args !== "object" || !("command" in args)) return false;
+  const command = String((args as { command?: unknown }).command ?? "").trim();
+  const executable = command.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:"[^"]+"|'[^']+'|\S+)/)?.[0]
+    ?.split(/\s+/).at(-1)?.replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").split("/").at(-1)?.toLowerCase();
+  return Boolean(executable && new Set([
+    "cat", "type", "more", "less", "head", "tail", "grep", "rg", "find", "ls", "dir", "pwd", "where", "which",
+  ]).has(executable));
 }
 
 function modelIdentityHash(model: ModelConfig): string {

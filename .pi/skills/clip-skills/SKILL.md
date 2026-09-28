@@ -7,7 +7,7 @@ description: 面向 AI Agent 的视频剪辑技能套件，把各大剪辑博主
 
 ## Clip Studio 本地素材复用
 
-在 Clip Studio 视频任务中，先用 `node <本技能目录>/scripts/media-cache.mjs index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立 `media-index.json`。命令只读取媒体、抽帧与生成宫格；缓存位于程序的 `.runtime/media-cache/v1`，不会替你选镜头。参考片每秒取样，长素材默认每三秒取样，短素材更密；实际参考要求、节奏判断和选材方案每个任务重新做。
+在 Clip Studio 视频任务中，先用 `node <任务提示提供的素材索引脚本绝对路径> index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立 `media-index.json`。任务 Session 的当前目录是工作目录，不能使用相对 `.pi` 路径。命令只读取媒体、抽帧与生成宫格；缓存位于程序的 `.runtime/media-cache/v1`，不会替你选镜头。参考片每秒取样，长素材默认每三秒取样，短素材更密；实际参考要求、节奏判断和选材方案每个任务重新做。
 
 索引中的 `cacheHit` 表示文件身份及版本未变，可直接复用 FFprobe 信息、画面、来源中立的观察和转写。新文件或变化文件才重新提取。看不清的候选区间用 `detail --file <视频> --at <秒> --workspace <当前任务工作目录> --output <该目录中的图片>` 定点取图；`--original` 才输出原始长边。模型缩小或拒绝大宫格时，只读较少帧或用 detail 检查，画面不得拉伸。
 

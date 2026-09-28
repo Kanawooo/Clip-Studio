@@ -14,6 +14,7 @@ export interface TaskAccessPolicyOptions {
 }
 
 interface TaskAccessBoundary {
+  projectRoot: string;
   workspace: string;
   workspaceReal: string;
   outputDir: string;
@@ -59,7 +60,10 @@ export function createTaskAccessHandler(
   return (event) => {
     const reason = taskAccessViolation(event, boundary);
     if (!reason) {
-      blockedCalls = 0;
+      // A read-only lookup does not prove that the agent recovered from a
+      // policy violation. Keep the count so blocked calls cannot be hidden
+      // between repeated log/source inspections.
+      if (!isReadOnlyTool(event.toolName)) blockedCalls = 0;
       return undefined;
     }
     blockedCalls += 1;
@@ -72,6 +76,7 @@ function createBoundary(options: TaskAccessPolicyOptions): TaskAccessBoundary {
   const projectRoot = path.resolve(options.projectRoot);
   const workspace = path.resolve(options.workspace);
   return {
+    projectRoot,
     workspace,
     workspaceReal: realpathSync.native(workspace),
     outputDir: path.resolve(options.outputDir),
@@ -82,6 +87,10 @@ function createBoundary(options: TaskAccessPolicyOptions): TaskAccessBoundary {
       "scripts",
       "dist",
       path.join("web", "src"),
+      ".git",
+      ".codex",
+      ".trellis",
+      path.join("data", "tasks"),
     ].map((entry) => path.resolve(projectRoot, entry)),
     mediaCacheScript: path.resolve(projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs"),
     renderQueueScript: path.resolve(projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs"),
@@ -220,6 +229,14 @@ function validateTrustedNodeScript(
   const script = args.find((arg) => !arg.startsWith("-"));
   if (!script || script === "-") return undefined;
   const resolved = path.resolve(cwd, script);
+  const expectedRelative = (target: string) => path.relative(boundary.projectRoot, target).replace(/\\/g, "/").toLowerCase();
+  const supplied = script.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.mediaCacheScript))) {
+    return `素材索引脚本必须使用绝对路径：${boundary.mediaCacheScript}`;
+  }
+  if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.renderQueueScript))) {
+    return `渲染队列脚本必须使用绝对路径：${boundary.renderQueueScript}`;
+  }
   if (samePath(resolved, boundary.mediaCacheScript)) {
     const subcommand = args[args.indexOf(script) + 1]?.toLowerCase();
     if (["index", "detail", "window", "resheet"].includes(subcommand ?? "")) {
@@ -334,6 +351,7 @@ function explicitProtectedPath(words: string[], cwd: string, boundary: TaskAcces
     for (const candidate of pathCandidates(word)) {
       if (containsDynamicPath(candidate)) continue;
       const resolved = path.resolve(cwd, candidate);
+      if (isInsideOrEqual(boundary.workspace, resolved)) continue;
       if (boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, resolved))) return READ_BLOCK_REASON;
     }
     if (/(?:^|[\\/])\.\.[\\/](?:\.\.[\\/])*(?:src|tests|scripts|dist|node_modules)(?:[\\/]|$)/i.test(word)) {
@@ -435,6 +453,10 @@ function hasOpaqueShellSyntax(command: string): boolean {
 
 function isEnvironmentAssignment(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(value);
+}
+
+function isReadOnlyTool(toolName: string): boolean {
+  return toolName === "read" || toolName === "grep" || toolName === "find" || toolName === "ls";
 }
 
 function executableName(value: string): string {
