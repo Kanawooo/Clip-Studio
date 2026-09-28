@@ -32,6 +32,10 @@ export const abortTask = (taskId: string) => requestJson<AbortTaskResponse>(`/ap
   method: "POST",
   body: "{}",
 });
+export const retryTask = (taskId: string, model: ModelConfig) => requestJson<CreateTaskResponse>(`/api/tasks/${encodeURIComponent(taskId)}/retry`, {
+  method: "POST",
+  body: JSON.stringify({ model }),
+});
 export const testModel = (model: ModelConfig) => requestJson<TestConnectionResponse>("/api/models/test", {
   method: "POST",
   body: JSON.stringify(model),

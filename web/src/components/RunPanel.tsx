@@ -1,4 +1,4 @@
-import { CircleCheck, CircleStop, FolderOpen, LoaderCircle, OctagonAlert, Video } from "lucide-react";
+import { CircleCheck, CircleStop, FolderOpen, LoaderCircle, OctagonAlert, RotateCcw, Video } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getTaskOutputVideoUrl, revealTaskOutput } from "../api/tasks.ts";
 import type { Task, TaskStatus } from "../types/api.ts";
@@ -7,7 +7,10 @@ interface RunPanelProps {
   task: Task | null;
   blockedByRunningTask?: boolean;
   aborting: boolean;
+  retrying: boolean;
+  retryBlocked?: boolean;
   onAbort(): void;
+  onRetry(): void;
   onError(message: string): void;
 }
 
@@ -19,7 +22,7 @@ const STATUS: Record<TaskStatus, { label: string; icon: typeof LoaderCircle }> =
   aborted: { label: "已停止", icon: CircleStop },
 };
 
-export function RunPanel({ task, blockedByRunningTask = false, aborting, onAbort, onError }: RunPanelProps) {
+export function RunPanel({ task, blockedByRunningTask = false, aborting, retrying, retryBlocked = false, onAbort, onRetry, onError }: RunPanelProps) {
   const elapsed = useTaskElapsed(task);
 
   if (!task) {
@@ -59,6 +62,11 @@ export function RunPanel({ task, blockedByRunningTask = false, aborting, onAbort
           {active ? (
             <button className="stop-button" type="button" disabled={aborting} onClick={onAbort}>
               <CircleStop size={17} />{aborting ? "正在停止…" : "停止"}
+            </button>
+          ) : null}
+          {task.status === "failed" || task.status === "aborted" ? (
+            <button className="secondary-button" type="button" disabled={retrying || retryBlocked} onClick={onRetry}>
+              <RotateCcw size={17} />{retrying ? "正在继续…" : "重试 / 继续制作"}
             </button>
           ) : null}
           <button className="secondary-button" type="button" onClick={() => void reveal()}>
@@ -102,6 +110,11 @@ function useTaskElapsed(task: Task | null): string {
   }, [active, task?.id]);
 
   if (!task) return "00:00:00";
+  if (typeof task.activeDurationMs === "number") {
+    const attempt = active && task.attemptStartedAt ? Date.parse(task.attemptStartedAt) : NaN;
+    const current = Number.isFinite(attempt) ? Math.max(0, now - attempt) : 0;
+    return formatElapsed(Math.max(0, task.activeDurationMs + current));
+  }
   const startedAt = Date.parse(task.createdAt);
   const finishedAt = active ? now : Date.parse(task.finishedAt ?? "");
   if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return "--:--:--";

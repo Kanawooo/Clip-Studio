@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, ChevronDown, Eye, EyeOff, LoaderCircle, Search, Settings2, X } from "lucide-react";
+import { AlertCircle, Check, CheckCircle2, ChevronDown, Eye, EyeOff, LoaderCircle, Search, Settings2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { discoverModels, setModelThinkingCapability, testModel } from "../api/tasks.ts";
 import {
@@ -17,7 +17,6 @@ import type {
   VisionProbeStatus,
 } from "../types/api.ts";
 import { RoundedSelect } from "./RoundedSelect.tsx";
-import { RoundedMultiSelect } from "./RoundedMultiSelect.tsx";
 
 const THINKING_LEVEL_LABELS: Record<ModelThinkingLevel, string> = {
   off: "关闭",
@@ -254,9 +253,12 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
         draftRef.current = next;
         setDraft(next);
         const saved = await props.onAutoSave(next);
+        const visionLabel = status === "supported"
+          ? "图片可用"
+          : status === "unsupported" ? "图片不支持" : "图片能力未确认";
         setTestResult({
           kind,
-          text: `连接成功${result.latencyMs ? ` · ${result.latencyMs}ms` : ""}${saved ? " · 已自动保存" : ""}`,
+          text: `连接成功 · ${visionLabel}${result.latencyMs ? ` · ${result.latencyMs}ms` : ""}${saved ? " · 已自动保存" : ""}`,
           detail: [result.vision?.message, thinking.message].filter(Boolean).join(" · "),
         });
         return;
@@ -439,13 +441,8 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
                 : "测试模型后获取可用档位"}。强度越高通常耗时越长、Token 消耗越多。</span>
               {manualThinkingEditable ? (
                 <div className="manual-thinking">
-                  <RoundedMultiSelect
-                    id="manual-thinking-levels"
-                    ariaLabel="手动设置可用档位"
+                  <ManualThinkingOptions
                     values={manualThinkingLevels}
-                    options={THINKING_LEVEL_OPTIONS}
-                    placeholder="手动设置可用档位"
-                    confirmLabel="确认可用档位"
                     saving={savingThinking}
                     disabled={!capabilityForSettings(draft)?.capabilityId || savingThinking}
                     onConfirm={(levels) => void saveManualThinking(levels)}
@@ -463,6 +460,53 @@ export function SettingsDrawer(props: SettingsDrawerProps) {
 
         <footer className="drawer-footer"><button className="quiet-button" type="button" onClick={props.onClose}>取消</button><button className="primary-button" type="button" onClick={() => void props.onSave(draftRef.current)}>保存设置</button></footer>
       </aside>
+    </div>
+  );
+}
+
+function ManualThinkingOptions(props: {
+  values: ModelThinkingLevel[];
+  saving: boolean;
+  disabled: boolean;
+  onConfirm(values: ModelThinkingLevel[]): void;
+}) {
+  const [selected, setSelected] = useState<ModelThinkingLevel[]>(props.values);
+  useEffect(() => setSelected(props.values), [props.values]);
+
+  const toggle = (level: ModelThinkingLevel) => {
+    setSelected((current) => THINKING_LEVEL_ORDER.filter((item) => (
+      item === level ? !current.includes(item) : current.includes(item)
+    )));
+  };
+
+  return (
+    <div className="manual-thinking-options">
+      <p className="manual-thinking-title">手动确认可用档位</p>
+      <div className="manual-thinking-grid" role="group" aria-label="手动确认可用思考档位">
+        {THINKING_LEVEL_OPTIONS.map(({ value, label }) => {
+          const level = value as ModelThinkingLevel;
+          const checked = selected.includes(level);
+          return (
+            <button
+              key={level}
+              type="button"
+              className={`manual-thinking-option${checked ? " selected" : ""}`}
+              aria-pressed={checked}
+              disabled={props.disabled}
+              onClick={() => toggle(level)}
+            >
+              <span className="manual-thinking-check" aria-hidden="true">{checked ? <Check size={13} /> : null}</span>
+              <span>{label}</span>
+            </button>
+          );
+        })}
+      </div>
+      <button
+        className="secondary-button manual-thinking-confirm"
+        type="button"
+        disabled={props.disabled || props.saving || selected.length === 0}
+        onClick={() => props.onConfirm(selected)}
+      >{props.saving ? "正在保存…" : "确认可用档位"}</button>
     </div>
   );
 }

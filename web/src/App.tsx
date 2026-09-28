@@ -1,4 +1,4 @@
-import { Clock3, Plus, Settings2 } from "lucide-react";
+import { Clapperboard, Clock3, Plus, Settings2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { connectTaskEvents } from "./api/sse.ts";
 import {
@@ -9,6 +9,7 @@ import {
   getModels,
   getTask,
   listTasks,
+  retryTask,
   saveLocalDraft,
   saveLocalSettings,
 } from "./api/tasks.ts";
@@ -25,7 +26,7 @@ import {
   settingsForPersistence,
   settingsFromLocalState,
 } from "./state/storage.ts";
-import type { AppSettings, CreateTaskInput, HealthResponse, ModelCatalogItem, Task, TaskDraft, TaskEvent } from "./types/api.ts";
+import type { AppSettings, CreateTaskInput, HealthResponse, ModelCatalogItem, ModelConfig, Task, TaskDraft, TaskEvent } from "./types/api.ts";
 
 const FRONTEND_BUILD_ID = typeof __FRONTEND_BUILD_ID__ === "string" ? __FRONTEND_BUILD_ID__ : "test";
 
@@ -42,6 +43,7 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [aborting, setAborting] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [connection, setConnection] = useState<"checking" | "connected" | "degraded" | "disconnected">("checking");
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
@@ -203,6 +205,23 @@ export default function App() {
     }
   };
 
+  const handleRetry = async () => {
+    if (!selectedTask || (selectedTask.status !== "failed" && selectedTask.status !== "aborted")) return;
+    if (busy) return notify("当前任务结束后才能继续此任务", "info");
+    if (!modelConfigured) {
+      notify("请先在模型设置中填写原任务的模型密钥", "error");
+      setSettingsOpen(true);
+      return;
+    }
+    setRetrying(true);
+    try {
+      await retryTask(selectedTask.id, buildModelInput(settings));
+      mergeTask(await getTask(selectedTask.id));
+      notify("正在继续原任务", "success");
+    } catch (error) { notify(errorMessage(error), "error"); }
+    finally { setRetrying(false); }
+  };
+
   const handleNewTask = () => {
     setHistoryOpen(false);
     setSelectedTaskId(null);
@@ -248,42 +267,52 @@ export default function App() {
     return <div className="bootstrap-screen"><div className="bootstrap-card"><strong>无法加载界面</strong><p>{loadError}</p><button className="secondary-button" type="button" onClick={() => setReloadKey((value) => value + 1)}>重新加载</button></div></div>;
   }
 
+  const activeNav = settingsOpen ? "settings" : historyOpen || selectedTaskId !== null ? "history" : "new";
+
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="product-mark"><span aria-hidden="true" /><strong>Clip Studio</strong></div>
-        <div className="top-actions">
-          <button className={`top-action-button${selectedTaskId === null ? " active" : ""}`} type="button" onClick={handleNewTask}>
-            <Plus size={17} /><span className="top-action-label">新建任务</span>
+      <aside className="app-sidebar">
+        <div className="product-mark"><span className="product-icon"><Clapperboard size={20} aria-hidden="true" /></span><strong>Clip Studio</strong></div>
+        <nav className="sidebar-nav" aria-label="主导航">
+          <button className={`nav-button${activeNav === "new" ? " active" : ""}`} type="button" aria-current={activeNav === "new" ? "page" : undefined} onClick={handleNewTask}>
+            <Plus size={17} /><span>新建任务</span>
           </button>
-          <button className={`top-action-button${historyOpen || selectedTaskId !== null ? " active" : ""}`} type="button" aria-expanded={historyOpen} onClick={() => { setSettingsOpen(false); setHistoryOpen(true); }}>
-            <Clock3 size={17} /><span className="top-action-label">历史任务</span>
+          <button className={`nav-button${activeNav === "history" ? " active" : ""}`} type="button" aria-current={activeNav === "history" ? "page" : undefined} aria-expanded={historyOpen} onClick={() => { setSettingsOpen(false); setHistoryOpen(true); }}>
+            <Clock3 size={17} /><span>历史任务</span>
           </button>
-          <span className={`connection-pill ${connection}`}><span />{connectionLabel(connection, health)}</span>
-          <button className="top-action-button" type="button" aria-expanded={settingsOpen} onClick={() => { setHistoryOpen(false); setSettingsOpen(true); }}>
-            <Settings2 size={17} /><span className="top-action-label">模型设置</span>
+          <button className={`nav-button${activeNav === "settings" ? " active" : ""}`} type="button" aria-expanded={settingsOpen} onClick={() => { setHistoryOpen(false); setSettingsOpen(true); }}>
+            <Settings2 size={17} /><span>模型设置</span>
           </button>
-        </div>
-      </header>
+        </nav>
+      </aside>
 
-      <main className="workspace-grid">
-        <TaskComposer
-          draft={draft}
-          disabled={Boolean(busy)}
-          submitting={submitting}
-          settingsReady={settingsReady}
-          onChange={setDraft}
-          onSubmit={() => void handleCreate()}
-          onError={(message) => notify(message, "error")}
-        />
-        <RunPanel
-          task={selectedTask}
-          blockedByRunningTask={Boolean(runningTask && !selectedTask)}
-          aborting={aborting}
-          onAbort={() => void handleAbort()}
-          onError={(message) => notify(message, "error")}
-        />
-      </main>
+      <div className="app-main">
+        <header className="page-header">
+          <p className="page-title">{selectedTaskId === null ? "新建任务" : "任务详情"}</p>
+          <span className={`connection-pill ${connection}`}><span />{connectionLabel(connection, health)}</span>
+        </header>
+        <main className="workspace-grid">
+          <TaskComposer
+            draft={draft}
+            disabled={Boolean(busy)}
+            submitting={submitting}
+            settingsReady={settingsReady}
+            onChange={setDraft}
+            onSubmit={() => void handleCreate()}
+            onError={(message) => notify(message, "error")}
+          />
+          <RunPanel
+            task={selectedTask}
+            blockedByRunningTask={Boolean(runningTask && !selectedTask)}
+            aborting={aborting}
+            retrying={retrying}
+            retryBlocked={busy}
+            onAbort={() => void handleAbort()}
+            onRetry={() => void handleRetry()}
+            onError={(message) => notify(message, "error")}
+          />
+        </main>
+      </div>
 
       <SettingsDrawer
         open={settingsOpen}
@@ -317,7 +346,13 @@ function buildCreateInput(draft: TaskDraft, settings: AppSettings): CreateTaskIn
     outputDir: draft.outputDir.trim(),
     taskRequest: draft.taskRequest.trim(),
     generateCount: Math.min(20, Math.max(1, draft.generateCount)),
-    model: {
+    model: buildModelInput(settings),
+    modelCapabilityId,
+  };
+}
+
+function buildModelInput(settings: AppSettings): ModelConfig {
+  return {
       provider: settings.provider.trim(),
       model: settings.model.trim(),
       ...(settings.apiKey ? { apiKey: settings.apiKey } : { credentialRef: "main" as const }),
@@ -327,14 +362,13 @@ function buildCreateInput(draft: TaskDraft, settings: AppSettings): CreateTaskIn
         input: modelInputCapabilities(settings),
       } : {}),
       thinkingLevel: settings.thinkingLevel,
-    },
-    modelCapabilityId,
   };
 }
 
 function applyTaskEvent(task: Task, event: TaskEvent): Task {
   if (event.type === "task") {
-    return { ...task, status: event.status, statusText: event.statusText, error: event.error ?? task.error };
+    return { ...task, status: event.status, statusText: event.statusText,
+      error: event.error ?? (isActive(event.status) ? null : task.error) };
   }
   if (event.type === "status") return { ...task, statusText: event.message };
   return task;

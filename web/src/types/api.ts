@@ -54,6 +54,8 @@ export interface Task {
   model: { provider: string; model: string; thinkingLevel?: ModelThinkingLevel };
   startedAt?: string | null;
   finishedAt?: string | null;
+  activeDurationMs?: number | null;
+  attemptStartedAt?: string | null;
   outputs: TaskOutput[];
   error?: string | null;
 }
