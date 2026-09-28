@@ -11,6 +11,24 @@ description: >
 
 # HyperFrames CLI
 
+## Clip Studio 多成片渲染
+
+Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪辑方案、HyperFrames 工程和 composition。准备渲染时，在当前任务工作目录写一份 `render-manifest.json`：
+
+```json
+{
+  "version": 1,
+  "project": "video-project",
+  "settings": { "format": "mp4", "fps": 30, "quality": "high" },
+  "rows": [
+    { "composition": "compositions/01.html", "output": "成片-01.mp4", "status": "pending" },
+    { "composition": "compositions/02.html", "output": "成片-02.mp4", "status": "pending" }
+  ]
+}
+```
+
+`project` 相对当前任务工作目录；`composition` 相对该工程；`output` 相对用户选择的输出目录。两处都不能跨出各自目录。工程与成片顺序由你决定，清单不保存密钥。若工作目录已有有效清单，先读它并保留已完成行，不要重写为全新清单。调用 `node <本技能目录>/scripts/render-queue.mjs run --manifest <清单绝对路径> --workspace <当前任务工作目录> --output-dir <用户输出目录>`，等待前台命令结束。CLI 根据本机可用 CPU、内存和渲染进程内存调整并发；正常渲染请求 HyperFrames `--gpu`，仅硬件路径失败时对该条尝试一次软件路径。每条输出通过 FFprobe 后才记为完成。失败后再次调用同一清单只处理缺失行，已有可验证成片保持不变。不要另起 Pi Session 或安装依赖。
+
 Run commands as `npx hyperframes ...` unless project instructions provide a wrapper. Obey the wrapper when present. The CLI requires Node.js 22 or newer and FFmpeg.
 
 ## Development loop

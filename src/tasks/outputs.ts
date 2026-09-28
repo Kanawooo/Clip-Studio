@@ -45,7 +45,7 @@ export async function scanVideoFiles(rootDir: string): Promise<VideoFileInfo[]> 
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         await walk(fullPath);
-      } else if (entry.isFile() && isVideoFile(entry.name)) {
+      } else if (entry.isFile() && isVideoFile(entry.name) && !entry.name.startsWith(".clip-studio-")) {
         try {
           const stat = await fs.stat(fullPath);
           found.push({ path: fullPath, mtimeMs: stat.mtimeMs, size: stat.size });
@@ -64,29 +64,29 @@ export async function scanVideoFiles(rootDir: string): Promise<VideoFileInfo[]> 
 export async function filterPlayableVideoFiles(files: string[]): Promise<string[]> {
   const playable: string[] = [];
   for (const filePath of files) {
-    try {
-      const { stdout } = await execFileAsync(
-        process.env.HYPERFRAMES_FFPROBE_PATH?.trim() || "ffprobe",
-        [
-          "-v",
-          "error",
-          "-select_streams",
-          "v:0",
-          "-show_entries",
-          "stream=codec_type",
-          "-of",
-          "default=noprint_wrappers=1:nokey=1",
-          filePath,
-        ],
-        { timeout: 30_000, maxBuffer: 1_000_000 },
-      );
-      if (stdout.trim() === "video") playable.push(filePath);
-    } catch (error) {
-      if (isProcessExit(error)) continue;
-      throw error;
-    }
+    if (!await videoProbeFailure(filePath)) playable.push(filePath);
   }
   return playable;
+}
+
+/** Return the real FFprobe reason for an invalid settled candidate. */
+export async function videoProbeFailure(filePath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      process.env.HYPERFRAMES_FFPROBE_PATH?.trim() || "ffprobe",
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type:format=duration", "-of", "json", filePath],
+      { timeout: 30_000, maxBuffer: 1_000_000 },
+    );
+    const data = JSON.parse(stdout) as { streams?: Array<{ codec_type?: string }>; format?: { duration?: string } };
+    if (data.streams?.[0]?.codec_type !== "video") return `FFprobe 未找到视频流：${filePath}`;
+    if (!(Number(data.format?.duration) > 0)) return `FFprobe 未找到有效时长：${filePath}`;
+    return undefined;
+  } catch (error) {
+    if (!isProcessExit(error)) throw error;
+    const detail = typeof error === "object" && error && "stderr" in error
+      ? String(error.stderr).trim().slice(-1_000) : "";
+    return `FFprobe 验证失败（退出码 ${String((error as NodeJS.ErrnoException).code)}）：${detail || (error instanceof Error ? error.message : "未提供详细原因")}`;
+  }
 }
 
 /**

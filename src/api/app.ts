@@ -2,12 +2,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { TaskManager } from "../tasks/manager.js";
+import { redactSecrets } from "../security.js";
 import { handleDiscoverModels, handleListModels, handleSetThinkingCapability, handleTestModel } from "./models.js";
 import {
   handleAbortTask,
   handleCreateTask,
   handleGetTask,
   handleListTasks,
+  handleRetryTask,
   handleTaskEvents,
   sendJson,
 } from "./tasks.js";
@@ -56,7 +58,7 @@ export function createApp(options: AppOptions): {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
-      sendJson(res, 500, { error: message });
+      sendJson(res, 500, { error: redactSecrets(message, []) });
     });
   });
 
@@ -142,6 +144,12 @@ export function createApp(options: AppOptions): {
     const abortMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/abort$/);
     if (abortMatch && req.method === "POST") {
       await handleAbortTask(taskManager, decodeURIComponent(abortMatch[1]), res);
+      return;
+    }
+
+    const retryMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/retry$/);
+    if (retryMatch && req.method === "POST") {
+      await handleRetryTask(taskManager, decodeURIComponent(retryMatch[1]), req, res, localState);
       return;
     }
 

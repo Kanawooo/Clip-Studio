@@ -75,7 +75,17 @@ export interface Task {
     provider: string;
     model: string;
     thinkingLevel?: ModelThinkingLevel;
+    /** Original non-secret runtime settings, used only for same-task retry. */
+    input?: ModelInputCapability[];
+    requestedThinkingLevel?: ThinkingLevelSetting;
+    verifiedThinking?: VerifiedModelThinking;
+    fingerprint?: string;
   };
   outputs: TaskOutput[];
   error?: string;
+  sessionFile?: string;
+  outputBaseline?: Array<{ path: string; mtimeMs: number; size: number }>;
+  activeDurationMs?: number;
+  attemptStartedAt?: string;
+  lastHeartbeatAt?: string;
 }

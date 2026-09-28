@@ -22,6 +22,7 @@ export interface PiVideoSession {
   skills: Skill[];
   thinkingLevel: ModelThinkingLevel;
   sessionFile?: string;
+  getFailure(): string | undefined;
   dispose(): Promise<void>;
 }
 
@@ -29,14 +30,20 @@ export interface PiVideoSessionOptions {
   projectRoot: string;
   agentDir: string;
   workspace: string;
+  outputDir: string;
   sessionDir?: string;
+  resumeSessionFile?: string;
   model: ModelConfig;
 }
 
 /** Create exactly one native Pi Session for one video task. */
 export async function createPiVideoSession(options: PiVideoSessionOptions): Promise<PiVideoSession> {
   const { modelRuntime, model, thinkingLevel } = await createTaskModel(options.model);
-  const resourceLoader = await createProjectResourceLoader(options);
+  let policyFailure: string | undefined;
+  const resourceLoader = await createProjectResourceLoader({
+    ...options,
+    onPolicyTermination: (reason) => { policyFailure = `访问策略：${reason}`; },
+  });
   const { skills } = resourceLoader.getSkills();
   const skillNames = new Set(skills.map((skill) => skill.name));
   if (!skillNames.has("clip-skills") || !skillNames.has("hyperframes")) {
@@ -53,12 +60,15 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
       model,
       ...(thinkingLevel ? { thinkingLevel } : {}),
       resourceLoader,
-      sessionManager: SessionManager.create(options.workspace, sessionDir),
+      sessionManager: options.resumeSessionFile
+        ? SessionManager.open(options.resumeSessionFile, sessionDir, options.workspace)
+        : SessionManager.create(options.workspace, sessionDir),
       settingsManager: SettingsManager.inMemory({
         ...(process.env.PI_VIDEO_SHELL_PATH ? { shellPath: process.env.PI_VIDEO_SHELL_PATH } : {}),
         enableAnalytics: false,
         enableInstallTelemetry: false,
         compaction: { enabled: true, reserveTokens: 90_000, keepRecentTokens: 24_000 },
+        retry: { enabled: true, maxRetries: 2, baseDelayMs: 1_000, provider: { maxRetries: 2, maxRetryDelayMs: 5_000 } },
       }),
       tools: [...NATIVE_TOOL_NAMES],
     }));
@@ -75,6 +85,7 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
     skills,
     thinkingLevel: session.thinkingLevel as ModelThinkingLevel,
     sessionFile: session.sessionManager.getSessionFile(),
+    getFailure: () => policyFailure,
     async dispose() {
       session.dispose();
     },

@@ -98,9 +98,15 @@ export function taskToView(task: Task): Record<string, unknown> {
     statusText: task.statusText,
     createdAt: task.createdAt,
     input: task.input,
-    model: task.model,
+    model: {
+      provider: task.model.provider,
+      model: task.model.model,
+      ...(task.model.thinkingLevel ? { thinkingLevel: task.model.thinkingLevel } : {}),
+    },
     startedAt: task.startedAt ?? null,
     finishedAt: task.finishedAt ?? null,
+    activeDurationMs: task.activeDurationMs ?? null,
+    attemptStartedAt: task.attemptStartedAt ?? null,
     outputs: task.outputs,
     error: task.error ?? null,
   };
@@ -152,6 +158,26 @@ export async function handleAbortTask(manager: TaskManager, taskId: string, res:
   }
   const task = (await manager.abortTask(taskId))!;
   sendJson(res, 202, { taskId: task.id, status: task.status });
+}
+
+export async function handleRetryTask(
+  manager: TaskManager,
+  taskId: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  localState: LocalStateStore,
+): Promise<void> {
+  if (!manager.getTask(taskId)) return sendJson(res, 404, { error: `task not found: ${taskId}` });
+  let model: ModelConfig | undefined;
+  try {
+    const raw = await localState.resolveRequestCredentials(await readJsonBody(req)) as Record<string, unknown>;
+    model = parseModelConfig(raw.model);
+    const task = await manager.retryTask(taskId, model);
+    sendJson(res, 202, { taskId: task!.id, status: task!.status });
+  } catch (error) {
+    const message = redactSecrets(errorMessage(error), [model?.apiKey]);
+    sendJson(res, error instanceof HttpError || error instanceof TaskCreateError ? error.statusCode : 500, { error: message });
+  }
 }
 
 export function handleTaskEvents(

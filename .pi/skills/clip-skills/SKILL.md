@@ -5,6 +5,20 @@ description: 面向 AI Agent 的视频剪辑技能套件，把各大剪辑博主
 
 # ClipSkills · 面向 Agent 的剪辑技能
 
+## Clip Studio 本地素材复用
+
+在 Clip Studio 视频任务中，先用 `node <本技能目录>/scripts/media-cache.mjs index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立 `media-index.json`。命令只读取媒体、抽帧与生成宫格；缓存位于程序的 `.runtime/media-cache/v1`，不会替你选镜头。参考片每秒取样，长素材默认每三秒取样，短素材更密；实际参考要求、节奏判断和选材方案每个任务重新做。
+
+索引中的 `cacheHit` 表示文件身份及版本未变，可直接复用 FFprobe 信息、画面、来源中立的观察和转写。新文件或变化文件才重新提取。看不清的候选区间用 `detail --file <视频> --at <秒> --workspace <当前任务工作目录> --output <该目录中的图片>` 定点取图；`--original` 才输出原始长边。模型缩小或拒绝大宫格时，只读较少帧或用 detail 检查，画面不得拉伸。
+
+需要检查连续候选片段时，用 `window --file <视频> --start <秒> --end <秒> --workspace <当前任务工作目录>` 只对该区间每秒取样，不重新扫描素材目录。
+
+若模型服务缩小或拒绝大宫格，用 `resheet --file <视频> --kind source --workspace <当前任务工作目录> --batch-size 9 --max-sheet 2048` 从已缓存的帧拆出较小宫格；这些参数可按服务实际情况调整，无须再解码原视频。
+
+把与当前参考无关的镜头内容/时间区间描述写进任务工作目录的 UTF-8 文本后，使用 `annotate --file <视频> --kind source --text-file <文本>` 保存，下次任务可复用；音频转写可用 `--kind audio --transcript`。不要存参考片评分、选镜排序、成片方案、密钥。多成片方案可写为 `{"outputs":[{"shots":[{"source":"绝对路径","start":0,"end":5}]}]}`，调用 `check-plan --file <方案 JSON>` 检查重复开场和长片段重叠；素材确实不足时可传 `--allow-reuse`，由你做最终选择。
+
+Clip Studio 的 Pi 任务始终在本 Session 内完成，不派生软件子 Agent。
+
 你是一个具备剪辑能力的 Agent。本技能把《影视飓风·剪辑全能必修课》与各大剪辑博主、专业后期的实战经验，内化为**可决策、可复现的规则**。
 核心设计：**判断逻辑（怎么剪、为什么、好坏怎么判）与软件操作（用什么剪）彻底分离**——前者在 `references/` 的 12 册软件无关知识内核，后者交给对应 `references/editor-*.md` 执行指南；每个剪辑软件用**独立子 Agent** 执行，避免上下文污染。
 

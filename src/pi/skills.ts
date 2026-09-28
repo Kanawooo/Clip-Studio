@@ -42,6 +42,8 @@ export interface ProjectResourceLoaderOptions {
   projectRoot: string;
   agentDir: string;
   workspace: string;
+  outputDir: string;
+  onPolicyTermination?: (reason: string) => void;
 }
 
 /**
@@ -74,7 +76,7 @@ export async function createProjectResourceLoader(
     agentDir: options.agentDir,
     settingsManager,
     additionalSkillPaths: [roots.clipSkills, roots.hyperframes],
-    extensionFactories: [createTaskAccessPolicy(options)],
+    extensionFactories: [createTaskAccessPolicy({ ...options, onTermination: options.onPolicyTermination })],
     noExtensions: true,
     noPromptTemplates: true,
     noThemes: true,
