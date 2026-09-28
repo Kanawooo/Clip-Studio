@@ -35,6 +35,7 @@ export function buildResumePrompt(
   verifiedOutputs: string[],
   paths: TaskExecutionPaths,
 ): string {
+  const renderCommand = `node "${paths.renderQueueScript}" run --manifest "${paths.workspace}/render-manifest.json" --workspace "${paths.workspace}" --output-dir "${input.outputDir.trim().replace(/\\/g, "/")}"`;
   const context = restoredSession ? "继续上次的视频任务，不重做已完成步骤。" : [
     "继续原视频任务；先从工作目录现有文件恢复已完成步骤。",
     `参考视频：${input.referenceVideo.trim()}`,
@@ -48,7 +49,7 @@ export function buildResumePrompt(
     context,
     `已验证成片：${verifiedOutputs.length ? verifiedOutputs.join("；") : "暂无"}。`,
     "检查当前任务工作目录的素材索引、工程和渲染清单；从最早未完成步骤继续，只补缺失成片。素材基础信息复用有效缓存，本次参考的选材判断保持原任务要求。",
-    `已有 ${paths.workspace}/render-manifest.json 时直接续跑清单。渲染队列必须使用绝对入口 ${paths.renderQueueScript}，素材索引必须使用绝对入口 ${paths.mediaCacheScript}；不得读取 Session 日志、其他任务、Trellis 或程序实现来猜测命令。`,
+    `已有 ${paths.workspace}/render-manifest.json 时，读取清单后立即执行并等待：${renderCommand}。不要读取渲染脚本实现；素材索引必须使用绝对入口 ${paths.mediaCacheScript}；不得读取 Session 日志、其他任务、Trellis 或程序实现来猜测命令。`,
     "仅通过项目本地 ClipSkills / HyperFrames 及其 CLI 工作，不安装依赖、不更新技能、不执行认证、doctor、发布或测试工程；直接完成并输出，失败时说明实际错误。",
   ].join("\n");
 }
