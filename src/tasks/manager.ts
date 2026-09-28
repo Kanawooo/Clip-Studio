@@ -115,7 +115,13 @@ export class TaskManager {
       });
       return {
         prompt: async (text) => {
-          await pi.session.prompt(text);
+          try {
+            await pi.session.prompt(text);
+          } catch (error) {
+            const policyFailure = pi.getFailure();
+            if (policyFailure) throw new Error(policyFailure, { cause: error });
+            throw error;
+          }
           const policyFailure = pi.getFailure();
           if (policyFailure) throw new Error(policyFailure);
           const lastAssistant = [...pi.session.messages].reverse().find((message) => message.role === "assistant");

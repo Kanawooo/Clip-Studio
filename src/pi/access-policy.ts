@@ -56,19 +56,23 @@ export function createTaskAccessHandler(
   options: TaskAccessPolicyOptions,
 ): (event: ToolCallEvent) => ToolCallEventResult | undefined {
   const boundary = createBoundary(options);
-  let blockedCalls = 0;
+  let repeatedViolation: { fingerprint: string; count: number } | undefined;
   return (event) => {
     const reason = taskAccessViolation(event, boundary);
     if (!reason) {
-      // A read-only lookup does not prove that the agent recovered from a
-      // policy violation. Keep the count so blocked calls cannot be hidden
-      // between repeated log/source inspections.
-      if (!isReadOnlyTool(event.toolName)) blockedCalls = 0;
+      // Any permitted operation proves that the session is still making a
+      // valid workflow decision. Never let an earlier denied lookup poison a
+      // later analysis, authoring or render step.
+      repeatedViolation = undefined;
       return undefined;
     }
-    blockedCalls += 1;
-    if (blockedCalls >= 3) options.onTermination?.(reason);
-    return { block: true, reason, terminate: blockedCalls >= 3 };
+    const fingerprint = violationFingerprint(event, reason);
+    repeatedViolation = repeatedViolation?.fingerprint === fingerprint
+      ? { fingerprint, count: repeatedViolation.count + 1 }
+      : { fingerprint, count: 1 };
+    const terminate = repeatedViolation.count >= 3;
+    if (terminate) options.onTermination?.(`${reason} 同一违规操作已连续重复 3 次。`);
+    return { block: true, reason, terminate };
   };
 }
 
@@ -114,17 +118,25 @@ function taskAccessViolation(event: ToolCallEvent, boundary: TaskAccessBoundary)
   if (!candidate) return undefined;
   const resolved = path.resolve(boundary.workspace, candidate);
   if (isInsideOrEqual(boundary.workspace, resolved)) return undefined;
+  if (["grep", "find", "ls"].includes(event.toolName) && samePath(resolved, boundary.projectRoot)) {
+    return READ_BLOCK_REASON;
+  }
   return boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, resolved))
     ? READ_BLOCK_REASON
     : undefined;
 }
 
-function bashAccessViolation(command: string, boundary: TaskAccessBoundary): string | undefined {
+function bashAccessViolation(
+  command: string,
+  boundary: TaskAccessBoundary,
+  initialCwd = boundary.workspace,
+): string | undefined {
   if (!command.trim()) return undefined;
-  const tokens = tokenizeShell(command);
-  if (!tokens || hasOpaqueShellSyntax(command)) return OPAQUE_BLOCK_REASON;
+  const inspectedCommand = unwrapOuterSubshell(command);
+  const tokens = tokenizeShell(inspectedCommand);
+  if (!tokens || hasOpaqueShellSyntax(inspectedCommand)) return OPAQUE_BLOCK_REASON;
 
-  let cwd = boundary.workspace;
+  let cwd = initialCwd;
   let segment: string[] = [];
   for (let index = 0; index <= tokens.length; index += 1) {
     const token = tokens[index];
@@ -168,6 +180,8 @@ function inspectCommandSegment(
   const protectedReason = explicitProtectedPath(words, cwd, boundary);
   if (protectedReason) return { cwd, reason: protectedReason };
 
+  if (isRepositoryScan(command, args, cwd, boundary)) return { cwd, reason: READ_BLOCK_REASON };
+
   if (["env", "command"].includes(command)) {
     const nestedIndex = args.findIndex((arg) => !arg.startsWith("-") && !isEnvironmentAssignment(arg));
     return nestedIndex < 0
@@ -177,6 +191,13 @@ function inspectCommandSegment(
 
   if (["if", "then", "fi", "for", "while", "until", "case", "select", "do", "done", "function"].includes(command)) {
     return { cwd, reason: OPAQUE_BLOCK_REASON };
+  }
+
+  if (["bash", "sh", "cmd"].includes(command)) {
+    const source = shellCommandSource(command, args);
+    return { cwd, reason: source && !containsDynamicPath(source)
+      ? bashAccessViolation(source, boundary, cwd)
+      : OPAQUE_BLOCK_REASON };
   }
 
   if (command === "cd") {
@@ -361,6 +382,24 @@ function explicitProtectedPath(words: string[], cwd: string, boundary: TaskAcces
   return undefined;
 }
 
+function isRepositoryScan(
+  command: string,
+  args: string[],
+  cwd: string,
+  boundary: TaskAccessBoundary,
+): boolean {
+  if (!["rg", "grep", "find", "ls", "dir", "cat", "type", "head", "tail"].includes(command)) return false;
+  return args.some((arg) => pathCandidates(arg).some((candidate) =>
+    !containsDynamicPath(candidate) && samePath(path.resolve(cwd, candidate), boundary.projectRoot)));
+}
+
+function shellCommandSource(command: string, args: string[]): string | undefined {
+  const commandFlag = args.findIndex((arg) => command === "cmd"
+    ? arg.toLowerCase() === "/c"
+    : /^-[a-z]*c[a-z]*$/i.test(arg));
+  return commandFlag >= 0 ? args[commandFlag + 1] : undefined;
+}
+
 function pathCandidates(word: string): string[] {
   const candidates = [word];
   const equalsAt = word.indexOf("=");
@@ -455,12 +494,36 @@ function isEnvironmentAssignment(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(value);
 }
 
-function isReadOnlyTool(toolName: string): boolean {
-  return toolName === "read" || toolName === "grep" || toolName === "find" || toolName === "ls";
-}
-
 function executableName(value: string): string {
   return path.basename(value.replace(/\\/g, "/")).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+}
+
+function violationFingerprint(event: ToolCallEvent, reason: string): string {
+  return `${event.toolName}\n${reason}\n${JSON.stringify(event.input)}`;
+}
+
+function unwrapOuterSubshell(command: string): string {
+  const trimmed = command.trim();
+  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) return trimmed;
+  let quote: "'" | "\"" | undefined;
+  let depth = 0;
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index]!;
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else if (char === "\\" && quote === "\"") index += 1;
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (char === "(") depth += 1;
+    else if (char === ")") depth -= 1;
+    if (depth === 0 && index < trimmed.length - 1) return trimmed;
+    if (depth < 0) return trimmed;
+  }
+  return depth === 0 ? trimmed.slice(1, -1).trim() : trimmed;
 }
 
 function isInlineInterpreter(command: string, args: string[]): boolean {
