@@ -71,7 +71,9 @@ export async function handleDiscoverModels(
     apiKey = await localState.resolveApiKey(raw, "main");
     const protocol = discoveryProtocol(raw.protocol);
     const models = await discoverModels({ baseUrl, apiKey, protocol });
-    sendJson(res, 200, { models });
+    sendJson(res, 200, {
+      models: models.map(({ input: _input, canonicalIds: _canonicalIds, ...model }) => model),
+    });
   } catch (error) {
     const statusCode = error instanceof HttpError ? error.statusCode : 400;
     sendJson(res, statusCode, {

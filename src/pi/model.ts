@@ -13,8 +13,13 @@ import {
   type ModelThinkingLevelMap,
   type ThinkingCapability,
 } from "../tasks/types.js";
-import { discoverModels } from "./model-discovery.js";
-import { officialThinkingCapabilityView } from "./thinking-capabilities.js";
+import { discoverModels, type DiscoveredModel } from "./model-discovery.js";
+import {
+  modelIdentityCandidates,
+  resolveModelIdentity,
+  type ResolvedModelIdentity,
+} from "./model-identity.js";
+import { officialThinkingCapability, officialThinkingCapabilityView } from "./thinking-capabilities.js";
 
 export interface TaskModel {
   modelRuntime: ModelRuntime;
@@ -34,6 +39,8 @@ export interface ModelConnectionTestResult {
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 16_384;
+const MODEL_TEST_TIMEOUT_MS = 60_000;
+const MODEL_METADATA_TIMEOUT_MS = 8_000;
 
 /**
  * Convert the frontend model config into a native Pi model.
@@ -82,6 +89,10 @@ export async function createTaskModel(
   if (!config.input?.length || !config.input.includes("text")) {
     throw new Error("model.input must include text for a custom model");
   }
+  const isDeepSeekFlash = config.protocol === "openai-completions"
+    && officialThinkingCapability(modelId)?.canonicalId === "deepseek-flash";
+  const thinkingLevelMap = config.thinking?.levelMap
+    ?? (isDeepSeekFlash ? officialThinkingCapabilityView(modelId)?.levelMap : undefined);
 
   // registerProvider requires an auth method to exist on the provider config.
   // The key is held only in this process (extension provider config map). The
@@ -100,7 +111,14 @@ export async function createTaskModel(
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: DEFAULT_CONTEXT_WINDOW,
         maxTokens: DEFAULT_MAX_TOKENS,
-        ...(config.thinking?.levelMap ? { thinkingLevelMap: config.thinking.levelMap } : {}),
+        ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+        ...(isDeepSeekFlash ? { compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          maxTokensField: "max_tokens" as const,
+          requiresReasoningContentOnAssistantMessages: true,
+          thinkingFormat: "deepseek" as const,
+        } } : {}),
       },
     ],
   });
@@ -154,46 +172,126 @@ export async function listBuiltinModels(): Promise<ModelCatalogItem[]> {
 }
 
 export async function testModelConnection(config: ModelConfig): Promise<ModelConnectionTestResult> {
-  const { model } = await createTaskModel(config);
-  const response = await completeSimple(
-    model,
-    {
-      messages: [
-        {
-          role: "user",
-          content: "Reply with OK only.",
-          timestamp: Date.now(),
-        },
-      ],
-    },
-    {
-      apiKey: config.apiKey,
-      maxTokens: 8,
-      timeoutMs: 30_000,
-    },
-  );
-  if (response.stopReason === "error") {
-    throw new Error(response.errorMessage || "model connection failed");
+  const { model, modelRuntime } = await createTaskModel(config.baseUrl
+    ? { ...config, input: ["text", "image"] }
+    : config);
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(MODEL_TEST_TIMEOUT_MS)]);
+  try {
+    const textRequest = testTextConnection(config, model, signal);
+    const metadataRequest = config.baseUrl ? discoverTargetModels(config, signal) : Promise.resolve(undefined);
+    const discovery = await Promise.race([metadataRequest, textRequest.then(() => metadataRequest)]);
+    const metadata = discovery?.target;
+    const input = config.baseUrl
+      ? metadata?.input === null
+        ? undefined
+        : metadata?.input ?? knownModelInput(modelRuntime, model, config.model, discovery?.models ?? [])
+      : model.input;
+    const visionRequest = input === undefined
+      ? testVisionCapability(config, model, signal)
+      : Promise.resolve(visionResultFromModelInput(input));
+    const [, vision] = await Promise.all([textRequest, visionRequest]);
+    const thinking = config.baseUrl
+      ? customThinkingCapability(config, metadata, discovery?.models ?? [], modelRuntime, model)
+      : thinkingCapabilityFromModel(model);
+    return { vision: vision.vision, thinking };
+  } finally {
+    controller.abort();
   }
+}
 
-  const vision = await testVisionCapability(config, model);
-  const thinking = config.baseUrl
-    ? await testCustomThinkingCapability(config)
-    : thinkingCapabilityFromModel(model);
-  return { vision: vision.vision, thinking };
+async function discoverTargetModels(
+  config: ModelConfig,
+  signal: AbortSignal,
+): Promise<{ target: DiscoveredModel; models: DiscoveredModel[] } | undefined> {
+  if (!config.baseUrl || !config.protocol) return undefined;
+  try {
+    const models = await discoverModels({
+      baseUrl: config.baseUrl,
+      protocol: config.protocol,
+      apiKey: config.apiKey,
+    }, {
+      targetModelId: config.model,
+      includeTargetPage: true,
+      signal: AbortSignal.any([signal, AbortSignal.timeout(MODEL_METADATA_TIMEOUT_MS)]),
+    });
+    const target = models.find((candidate) => candidate.id === config.model);
+    return target ? { target, models } : undefined;
+  } catch {
+    if (signal.aborted) throw new Error("模型能力测试超时");
+    return undefined;
+  }
+}
+
+function knownModelInput(
+  runtime: ModelRuntime,
+  model: Model<any>,
+  modelId: string,
+  providerModels: readonly DiscoveredModel[],
+): readonly string[] | undefined {
+  const candidates = runtime.getModels().filter((candidate) => !sameModel(candidate, model));
+  const identity = resolveModelIdentity({
+    rawId: modelId,
+    providerModels,
+    catalog: candidates.map((candidate) => ({
+      key: modelKey(candidate),
+      id: candidate.id,
+      aliases: [`${candidate.provider}/${candidate.id}`],
+      capabilityKey: [...candidate.input].sort().join("|"),
+    })),
+  });
+  if (identity.conflict || identity.catalogKeys.length === 0) return undefined;
+  const matched = new Set(identity.catalogKeys);
+  return candidates.find((candidate) => matched.has(modelKey(candidate)))?.input;
+}
+
+function visionResultFromModelInput(input: readonly string[]): Pick<ModelConnectionTestResult, "vision"> {
+  if (input.includes("text") && input.includes("image")) {
+    return { vision: { status: "supported", message: "模型信息声明支持图片输入" } };
+  }
+  return { vision: { status: "unsupported", message: "模型信息声明未同时支持文本与图片输入" } };
+}
+
+async function testTextConnection(config: ModelConfig, model: Model<any>, signal: AbortSignal): Promise<void> {
+  let response;
+  try {
+    response = await completeSimple(
+      model,
+      {
+        messages: [
+          {
+            role: "user",
+            content: "Reply with OK only.",
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        apiKey: config.apiKey,
+        maxTokens: 1024,
+        maxRetries: 0,
+        timeoutMs: 30_000,
+        signal,
+      },
+    );
+  } catch (error) {
+    if (signal.aborted) throw new Error("模型连接测试超时");
+    throw error;
+  }
+  if (signal.aborted || response.stopReason === "aborted") {
+    throw new Error("模型连接测试超时");
+  }
+  if (response.stopReason === "error") throw new Error(response.errorMessage || "模型连接失败");
+  if (!response.content.some((item) => item.type === "text" && item.text.trim())) {
+    throw new Error("模型没有返回文本内容");
+  }
 }
 
 async function testVisionCapability(
   config: ModelConfig,
   model: Model<any>,
+  signal: AbortSignal,
 ): Promise<Pick<ModelConnectionTestResult, "vision">> {
-  if (!config.baseUrl && !model.input.includes("image")) {
-    return { vision: { status: "unsupported", message: "模型目录声明仅支持文本" } };
-  }
-
-  const visualModel = config.baseUrl
-    ? (await createTaskModel({ ...config, input: ["text", "image"] })).model
-    : model;
   let lastResult: Pick<ModelConnectionTestResult, "vision"> | undefined;
   let outputWasTruncated = false;
 
@@ -201,7 +299,7 @@ async function testVisionCapability(
     const probe = VISION_PROBE_ATTEMPTS[attempt];
     try {
       const visualResponse = await completeSimple(
-        visualModel,
+        model,
         {
           messages: [{
             role: "user",
@@ -218,10 +316,13 @@ async function testVisionCapability(
           maxRetries: 0,
           temperature: 0,
           timeoutMs: 30_000,
+          signal,
         },
       );
       if (visualResponse.stopReason === "error") {
-        lastResult = visionResultFromError(visualResponse.errorMessage || "图片请求失败");
+        return visionResultFromError(visualResponse.errorMessage || "图片请求失败");
+      } else if (signal.aborted || visualResponse.stopReason === "aborted") {
+        return inconclusive("图片能力测试超时，请重新测试");
       } else {
         const text = visualResponse.content
           .map((item) => item.type === "text" ? item.text : "")
@@ -232,7 +333,7 @@ async function testVisionCapability(
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      lastResult = visionResultFromError(message);
+      return visionResultFromError(message);
     }
 
     if (lastResult.vision.status !== "inconclusive") {
@@ -274,31 +375,48 @@ export function thinkingCapabilityFromModel(
   };
 }
 
-async function testCustomThinkingCapability(
+function customThinkingCapability(
   config: ModelConfig,
-): Promise<ModelConnectionTestResult["thinking"]> {
-  const metadata = await providerThinkingCapability(config);
-  const official = officialThinkingCapabilityView(config.model);
+  discovered?: DiscoveredModel,
+  providerModels: readonly DiscoveredModel[] = [],
+  runtime?: ModelRuntime,
+  model?: Model<any>,
+): ModelConnectionTestResult["thinking"] {
+  const metadata = providerThinkingCapability(discovered);
+  const identity = runtime && model && config.protocol
+    ? resolveThinkingIdentity(runtime, model, config.model, config.protocol, providerModels)
+    : resolveModelIdentity({ rawId: config.model, providerModels });
   if (metadata?.status === "unsupported") return metadata;
-  if (official && metadata?.status === "supported") {
-    const levels = official.levels.filter((level) => metadata.levels.includes(level));
-    if (levels.length === 0) {
-      return {
-        status: "unverified",
-        levels: [],
-        source: "unverified",
-        message: "模型服务返回的档位与官方资料不一致，未自动采用",
-      };
-    }
+  if (metadata) return recommendPreset(metadata, identity.presetThinkingLevel, false);
+  if (identity.conflict) return unverifiedThinking(identity.conflict);
+
+  const pi = runtime && model
+    ? thinkingCapabilityForIdentity(runtime, model, identity)
+    : undefined;
+  if (pi && !(pi.status === "unsupported" && discovered?.reasoning === true)) {
+    return recommendPreset(pi, identity.presetThinkingLevel, identity.evidence === "catalog-base");
+  }
+
+  const official = officialThinkingForIdentity(config.model, identity);
+  if (official) return recommendPreset(official, identity.presetThinkingLevel, Boolean(identity.baseId));
+
+  if (identity.siblingLevels.length > 0) {
     return supportedThinkingCapability(
-      levels,
+      identity.siblingLevels,
       "provider-metadata",
-      "已按模型服务与官方资料的共同档位确认",
-      official.recommendedLevel && levels.includes(official.recommendedLevel) ? official.recommendedLevel : undefined,
+      `模型服务中的同系列型号提供 ${identity.siblingLevels.length} 个思考档位`,
+      identity.presetThinkingLevel,
     );
   }
-  if (official) return official;
-  if (metadata) return metadata;
+
+  if (identity.presetThinkingLevel) {
+    return supportedThinkingCapability(
+      [identity.presetThinkingLevel],
+      "unverified",
+      `模型名预设：${thinkingLevelLabel(identity.presetThinkingLevel)}（仅确认这一档）`,
+      identity.presetThinkingLevel,
+    );
+  }
   return {
     status: "unverified",
     levels: [],
@@ -307,32 +425,123 @@ async function testCustomThinkingCapability(
   };
 }
 
-async function providerThinkingCapability(
-  config: ModelConfig,
-): Promise<ModelConnectionTestResult["thinking"] | undefined> {
-  if (!config.baseUrl || !config.protocol) return undefined;
-  try {
-    const discovered = await discoverModels({
-      baseUrl: config.baseUrl,
-      protocol: config.protocol,
-      apiKey: config.apiKey,
-    });
-    const item = discovered.find((candidate) => candidate.id === config.model);
-    if (!item || item.reasoning === undefined) return undefined;
-    if (item.reasoning === false) {
-      return {
-        status: "unsupported",
-        levels: [],
-        source: "provider-metadata",
-        message: "模型服务声明该模型没有可调思考强度",
-      };
-    }
-    if (!item.thinkingLevels?.length) return undefined;
-    const levels = normalizeThinkingLevels(item.thinkingLevels);
-    return supportedThinkingCapability(levels, "provider-metadata", "已从模型服务获取明确思考档位");
-  } catch {
-    return undefined;
+function providerThinkingCapability(
+  item?: DiscoveredModel,
+): ModelConnectionTestResult["thinking"] | undefined {
+  if (!item || item.reasoning === undefined) return undefined;
+  if (item.reasoning === false) {
+    return {
+      status: "unsupported",
+      levels: [],
+      source: "provider-metadata",
+      message: "模型服务声明该模型没有可调思考强度",
+    };
   }
+  if (!item.thinkingLevels?.length) return undefined;
+  const levels = normalizeThinkingLevels(item.thinkingLevels);
+  return supportedThinkingCapability(levels, "provider-metadata", "已从模型服务获取明确思考档位");
+}
+
+function resolveThinkingIdentity(
+  runtime: ModelRuntime,
+  customModel: Model<any>,
+  modelId: string,
+  protocol: NonNullable<ModelConfig["protocol"]>,
+  providerModels: readonly DiscoveredModel[],
+): ResolvedModelIdentity {
+  const candidates = runtime.getModels().filter((candidate) => (
+    !sameModel(candidate, customModel)
+    && candidate.api === protocol
+  ));
+  return resolveModelIdentity({
+    rawId: modelId,
+    providerModels,
+    catalog: candidates.map((candidate) => ({
+      key: modelKey(candidate),
+      id: candidate.id,
+      aliases: [`${candidate.provider}/${candidate.id}`],
+      capabilityKey: thinkingCapabilityKey(thinkingCapabilityFromModel(candidate)),
+    })),
+  });
+}
+
+function thinkingCapabilityForIdentity(
+  runtime: ModelRuntime,
+  customModel: Model<any>,
+  identity: ResolvedModelIdentity,
+): ModelConnectionTestResult["thinking"] | undefined {
+  const matched = new Set(identity.catalogKeys);
+  const candidate = runtime.getModels().find((item) => (
+    !sameModel(item, customModel) && matched.has(modelKey(item))
+  ));
+  return candidate ? thinkingCapabilityFromModel(candidate) : undefined;
+}
+
+function officialThinkingForIdentity(
+  modelId: string,
+  identity: ResolvedModelIdentity,
+): ModelConnectionTestResult["thinking"] | undefined {
+  const candidates = [
+    modelId,
+    ...(identity.baseId ? [identity.baseId] : []),
+    ...modelIdentityCandidates(modelId).base,
+  ];
+  for (const candidate of candidates) {
+    const capability = officialThinkingCapabilityView(candidate);
+    if (capability) return capability;
+  }
+  return undefined;
+}
+
+function recommendPreset(
+  capability: ModelConnectionTestResult["thinking"],
+  preset: ModelThinkingLevel | undefined,
+  requirePreset: boolean,
+): ModelConnectionTestResult["thinking"] {
+  if (!preset || capability.status !== "supported") return capability;
+  if (!capability.levels.includes(preset)) {
+    return requirePreset
+      ? unverifiedThinking(`模型名预设“${thinkingLevelLabel(preset)}”不在已确认档位中`)
+      : capability;
+  }
+  return { ...capability, recommendedLevel: preset };
+}
+
+function unverifiedThinking(message: string): ModelConnectionTestResult["thinking"] {
+  return {
+    status: "unverified",
+    levels: [],
+    source: "unverified",
+    message,
+  };
+}
+
+function thinkingCapabilityKey(capability: ModelConnectionTestResult["thinking"]): string {
+  return JSON.stringify([
+    capability.status,
+    capability.levels,
+    MODEL_THINKING_LEVELS.map((level) => capability.levelMap?.[level] ?? null),
+  ]);
+}
+
+function modelKey(model: Pick<Model<any>, "provider" | "id">): string {
+  return `${model.provider}\0${model.id}`;
+}
+
+function sameModel(left: Pick<Model<any>, "provider" | "id">, right: Pick<Model<any>, "provider" | "id">): boolean {
+  return left.provider === right.provider && left.id === right.id;
+}
+
+function thinkingLevelLabel(level: ModelThinkingLevel): string {
+  return ({
+    off: "关闭",
+    minimal: "最低",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高",
+    max: "最高",
+  } satisfies Record<ModelThinkingLevel, string>)[level];
 }
 
 function supportedThinkingCapability(

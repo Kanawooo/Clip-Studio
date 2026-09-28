@@ -13,11 +13,16 @@ export interface ModelDiscoveryConfig {
 export interface DiscoveredModel {
   id: string;
   name: string;
+  input?: ("text" | "image")[] | null;
   reasoning?: boolean;
   thinkingLevels?: ModelThinkingLevel[];
+  canonicalIds?: string[];
 }
 
-export async function discoverModels(config: ModelDiscoveryConfig): Promise<DiscoveredModel[]> {
+export async function discoverModels(
+  config: ModelDiscoveryConfig,
+  options: { targetModelId?: string; includeTargetPage?: boolean; signal?: AbortSignal } = {},
+): Promise<DiscoveredModel[]> {
   const endpoint = modelsEndpoint(config.baseUrl);
   const found = new Map<string, DiscoveredModel>();
   let afterId: string | undefined;
@@ -30,14 +35,23 @@ export async function discoverModels(config: ModelDiscoveryConfig): Promise<Disc
     const response = await fetch(url, {
       method: "GET",
       headers: discoveryHeaders(config),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]),
     });
     if (!response.ok) {
       throw new Error(`获取模型失败（HTTP ${response.status}）`);
     }
 
     const payload = await readLimitedJson(response);
-    for (const model of extractModels(payload)) {
+    const pageModels = extractModels(payload);
+    const target = options.targetModelId
+      ? pageModels.find((model) => model.id === options.targetModelId)
+      : undefined;
+    if (target) {
+      return options.includeTargetPage
+        ? [target, ...pageModels.filter((model) => model !== target)]
+        : [target];
+    }
+    for (const model of pageModels) {
       if (found.size >= MAX_MODELS) break;
       found.set(model.id, model);
     }
@@ -47,7 +61,7 @@ export async function discoverModels(config: ModelDiscoveryConfig): Promise<Disc
     afterId = paging.lastId;
   }
 
-  return [...found.values()].sort((a, b) => a.id.localeCompare(b.id));
+  return options.targetModelId ? [] : [...found.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function modelsEndpoint(baseUrl: string): string {
@@ -130,10 +144,31 @@ function extractModels(payload: unknown): DiscoveredModel[] {
       const id = item.id.trim();
       const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : id;
       const thinking = modelThinkingMetadata(item);
-      output.push({ id, name, ...thinking });
+      const input = modelInputMetadata(item);
+      const canonicalIds = modelCanonicalIds(item);
+      output.push({
+        id,
+        name,
+        ...thinking,
+        ...(input !== undefined ? { input } : {}),
+        ...(canonicalIds.length > 0 ? { canonicalIds } : {}),
+      });
     }
   }
   return output;
+}
+
+function modelInputMetadata(item: Record<string, unknown>): DiscoveredModel["input"] {
+  const architecture = isRecord(item.architecture) ? item.architecture : undefined;
+  const capabilities = isRecord(item.capabilities) ? item.capabilities : undefined;
+  const sources = [item.input, item.input_modalities, architecture?.input_modalities, capabilities?.input_modalities]
+    .filter(Array.isArray);
+  if (sources.length === 0) return undefined;
+  if (sources.some((source) => source.some((value) => typeof value !== "string"))) return null;
+  const inputs = sources.map((source) => (["text", "image"] as const)
+    .filter((modality) => source.some((value) => value.trim().toLocaleLowerCase() === modality)));
+  if (inputs.some((input) => input.join() !== inputs[0].join())) return null;
+  return [...inputs[0]];
 }
 
 function modelThinkingMetadata(item: Record<string, unknown>): Pick<DiscoveredModel, "reasoning" | "thinkingLevels"> {
@@ -153,11 +188,41 @@ function modelThinkingMetadata(item: Record<string, unknown>): Pick<DiscoveredMo
     capabilities?.reasoning,
     capabilities?.supports_reasoning,
   );
-  const reasoning = explicitReasoning ?? (thinkingLevels.length > 0 ? true : undefined);
+  const supportedParameters = [item.supported_parameters, capabilities?.supported_parameters]
+    .filter(Array.isArray)
+    .flatMap((items) => items.filter((value): value is string => typeof value === "string"))
+    .map((value) => value.trim().toLocaleLowerCase());
+  const reasoning = explicitReasoning
+    ?? (thinkingLevels.length > 0 || supportedParameters.some((value) => (
+      value === "reasoning" || value === "reasoning_effort" || value === "thinking"
+    )) ? true : undefined);
   return {
     ...(reasoning !== undefined ? { reasoning } : {}),
     ...(thinkingLevels.length > 0 ? { thinkingLevels } : {}),
   };
+}
+
+function modelCanonicalIds(item: Record<string, unknown>): string[] {
+  const values = [
+    item.base_model_id,
+    item.baseModelId,
+    item.base_model,
+    item.baseModel,
+    item.canonical_model_id,
+    item.canonicalModelId,
+    item.canonical_slug,
+    item.canonicalSlug,
+    item.root,
+  ];
+  const output: string[] = [];
+  for (const value of values) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const normalized = value.trim();
+    if (!output.some((candidate) => candidate.toLocaleLowerCase() === normalized.toLocaleLowerCase())) {
+      output.push(normalized);
+    }
+  }
+  return output;
 }
 
 function normalizeThinkingLevels(value: unknown): ModelThinkingLevel[] {
