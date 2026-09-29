@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Invoked by Pi through the project-local HyperFrames skill, never by TaskManager.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -51,16 +52,124 @@ async function runCapture(command, args, maxBytes = 2_000_000) {
   });
 }
 
-async function verifyVideo(file) {
+async function sha256(file) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function same(left, right) {
+  const a = path.resolve(left), b = path.resolve(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+async function mediaInfo(file) {
+  return JSON.parse(await runCapture(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", file]));
+}
+
+function attribute(tag, name) {
+  const quoted = tag.match(new RegExp(`(?:\\s|^)${name}\\s*=\\s*(["'])(.*?)\\1`, "i"));
+  return quoted?.[2] ?? tag.match(new RegExp(`(?:\\s|^)${name}\\s*=\\s*([^\\s>]+)`, "i"))?.[1];
+}
+
+function close(left, right, tolerance = 0.12) { return Math.abs(left - right) <= tolerance; }
+
+async function sourceIdentity(file) {
+  const stat = await fs.stat(file);
+  return { path: file, size: stat.size, mtimeMs: stat.mtimeMs, sha256: await sha256(file) };
+}
+
+async function validateAudio(row, composition, project, contract, fps) {
+  const html = await fs.readFile(composition, "utf8");
+  const rootTag = html.match(/<[a-z][^>]*\bdata-composition-id\s*=\s*(?:["'][^"']+["']|[^\s>]+)[^>]*>/i)?.[0];
+  const rootValue = rootTag && attribute(rootTag, "data-duration");
+  const rootDuration = rootValue === undefined ? undefined : Number(rootValue);
+  if (!rootTag || rootDuration === undefined || !Number.isFinite(rootDuration) || rootDuration <= 0) {
+    throw new Error("工程根必须显式设置有效的 data-duration");
+  }
+  const audioTags = [...html.matchAll(/<audio\b[^>]*>/gi)].map((match) => match[0]);
+  const inputs = [await sourceIdentity(composition)];
+  if (row.silentDuration !== undefined) {
+    if (!(Number(contract.silentDuration) > 0) || !close(Number(row.silentDuration), Number(contract.silentDuration))) {
+      throw new Error("无声成片必须在剪辑要求中明确写出无声和时长");
+    }
+    if (audioTags.length) throw new Error("无声成片的工程仍含音频轨");
+    if (!close(rootDuration, Number(row.silentDuration), Math.max(0.12, 2 / fps))) throw new Error("无声工程时长与要求不符");
+    return { target: Number(row.silentDuration), silent: true, inputs };
+  }
+  const supplied = row.mainAudio?.segments ?? (row.mainAudio?.source ? [{
+    source: row.mainAudio.source,
+    from: row.mainAudio.from,
+    to: row.mainAudio.to,
+    at: row.mainAudio.at ?? 0,
+    rate: row.mainAudio.rate,
+  }] : null);
+  if (!Array.isArray(supplied) || !supplied.length) throw new Error("缺少主音频：清单每条需声明 mainAudio.source 或 mainAudio.segments");
+  if (!audioTags.length) throw new Error("工程缺少主音频轨 <audio>");
+  let timelineEnd = 0;
+  for (const [index, segment] of supplied.entries()) {
+    if (!segment || typeof segment.source !== "string" || !segment.source.trim()) throw new Error(`主音频第 ${index + 1} 段缺少源文件`);
+    const candidate = path.resolve(project, segment.source);
+    const source = await fs.realpath(candidate);
+    if (!inside(contract.audioDir, source) && !inside(contract.workspace, source)) throw new Error(`主音频第 ${index + 1} 段超出音频目录/任务工作目录`);
+    const info = await mediaInfo(source);
+    const duration = Number(info.format?.duration);
+    if (!info.streams?.some((item) => item.codec_type === "audio") || !(duration > 0)) throw new Error(`主音频第 ${index + 1} 段没有有效音轨`);
+    const from = segment.from ?? 0, to = segment.to ?? duration, at = segment.at ?? timelineEnd, rate = segment.rate ?? 1;
+    if (![from, to, at, rate].every((value) => typeof value === "number" && Number.isFinite(value))
+      || from < 0 || to <= from || to > duration + 0.08 || at < 0 || rate <= 0 || rate > 8) {
+      throw new Error(`主音频第 ${index + 1} 段的源区间或播放速度无效`);
+    }
+    const length = (to - from) / rate;
+    if (!close(at, timelineEnd)) throw new Error(`主音频第 ${index + 1} 段未连续接上前一段`);
+    const matched = audioTags.some((tag) => {
+      const src = attribute(tag, "src");
+      if (!src || /^(?:https?|data|blob):/i.test(src) || /\bmuted\b/i.test(tag)) return false;
+      let actual;
+      try { actual = src.startsWith("file://") ? fileURLToPath(src) : path.resolve(project, src); }
+      catch { return false; }
+      const tagDurationValue = attribute(tag, "data-duration");
+      const tagDuration = tagDurationValue === undefined ? (duration - from) / rate : Number(tagDurationValue);
+      return same(actual, source) && close(Number(attribute(tag, "data-start")), at)
+        && close(tagDuration, length)
+        && close(Number(attribute(tag, "data-media-start") ?? 0), from)
+        && close(Number(attribute(tag, "data-playback-rate") ?? 1), rate, 0.01);
+    });
+    if (!matched) throw new Error(`主音频第 ${index + 1} 段未按相同源文件和时间区间进入工程音轨`);
+    inputs.push(await sourceIdentity(source));
+    timelineEnd = at + length;
+  }
+  if (!close(rootDuration, timelineEnd, Math.max(0.12, 2 / fps))) {
+    throw new Error(`工程时长 ${rootDuration.toFixed(2)} 秒与主音频 ${timelineEnd.toFixed(2)} 秒不符`);
+  }
+  return { target: timelineEnd, silent: false, inputs };
+}
+
+export async function verifyVideo(file, audioTarget, fps) {
   const stat = await fs.stat(file);
   if (!stat.isFile() || stat.size === 0) throw new Error(`输出为空：${file}`);
-  const info = JSON.parse(await runCapture(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", file]));
+  const info = await mediaInfo(file);
   const video = info.streams?.find((entry) => entry.codec_type === "video");
   const audio = info.streams?.find((entry) => entry.codec_type === "audio");
   if (video?.codec_name !== "h264" || !(Number(info.format?.duration) > 0)) {
     throw new Error(`FFprobe 验证失败：需要可播放的 H.264 视频和有效时长（${file}）`);
   }
   if (audio && audio.codec_name !== "aac") throw new Error(`FFprobe 验证失败：音频不是 AAC（${file}）`);
+  const tolerance = Math.max(0.25, 2 / fps);
+  if (!!audio === audioTarget.silent) throw new Error(`FFprobe 音轨与清单不符：${file}`);
+  if (!close(Number(info.format.duration), audioTarget.target, tolerance)) {
+    throw new Error(`成片时长 ${Number(info.format.duration).toFixed(2)} 秒与主音频 ${audioTarget.target.toFixed(2)} 秒不符`);
+  }
+  const videoDuration = Number(video.duration);
+  if (!(videoDuration > 0) || videoDuration < audioTarget.target - tolerance) {
+    throw new Error(`成片视频流时长不足或无法确认：${file}`);
+  }
+  if (audio) {
+    const audioDuration = Number(audio.duration);
+    if (!(audioDuration > 0) || audioDuration < audioTarget.target - tolerance) {
+      throw new Error(`成片音轨时长不足或无法确认：${file}`);
+    }
+  }
   return { bytes: stat.size, duration: Number(info.format.duration), videoCodec: video.codec_name, audioCodec: audio?.codec_name ?? null };
 }
 
@@ -70,17 +179,75 @@ async function writeManifest(file, value) {
   await fs.rename(temporary, file);
 }
 
+function receiptPath(context, row) { return path.join(context.deliveryDir, `${row.index + 1}.json`); }
+
+async function readReceipt(context, row) {
+  const file = receiptPath(context, row);
+  const stat = await fs.lstat(file).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+  if (!stat) return null;
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`第 ${row.index + 1} 条完成凭据不是普通文件`);
+  const receipt = JSON.parse(await fs.readFile(file, "utf8"));
+  if (receipt.version !== 1 || receipt.index !== row.index + 1 || !same(receipt.output, row.output)
+    || receipt.rowSignature !== row.rowSignature) {
+    throw new Error(`第 ${row.index + 1} 条已完成成片的工程或主音频被改写；请保持原交付行不变`);
+  }
+  return receipt;
+}
+
+async function publishReceipt(context, row, verified, renderedFile) {
+  const file = receiptPath(context, row);
+  const receipt = {
+    version: 1, index: row.index + 1, output: row.output,
+    bytes: verified.bytes, sha256: await sha256(renderedFile), duration: verified.duration,
+    audioTarget: row.audio.target, silent: row.audio.silent,
+    rowSignature: row.rowSignature, inputs: row.audio.inputs,
+  };
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+  await fs.rename(temporary, file);
+}
+
+async function assertInputsUnchanged(row) {
+  for (const input of row.audio.inputs) {
+    const stat = await fs.stat(input.path);
+    if (stat.size !== input.size || stat.mtimeMs !== input.mtimeMs || await sha256(input.path) !== input.sha256) {
+      throw new Error(`第 ${row.index + 1} 条渲染期间主音频或工程发生变化，请重新核对清单`);
+    }
+  }
+}
+
 export async function validatedManifest(options) {
   if (!options.manifest || !options.workspace || !options["output-dir"]) {
     throw new Error("run 需要 --manifest、--workspace 和 --output-dir");
   }
   const workspace = await fs.realpath(options.workspace);
   const outputDir = await fs.realpath(options["output-dir"]);
+  const deliveryDir = await fs.realpath(path.join(workspace, "..", "delivery"));
+  const contractPath = await fs.realpath(path.join(deliveryDir, "contract.json"));
+  if (!inside(deliveryDir, contractPath)) throw new Error("任务交付契约路径越界");
+  const contract = JSON.parse(await fs.readFile(contractPath, "utf8"));
+  const contractWorkspace = typeof contract.workspace === "string"
+    ? await fs.realpath(contract.workspace).catch(() => null) : null;
+  const contractOutputDir = typeof contract.outputDir === "string"
+    ? await fs.realpath(contract.outputDir).catch(() => null) : null;
+  if (contract.version !== 1 || !Array.isArray(contract.slots) || !contract.slots.length
+    || contract.slots.length > 20 || !contractWorkspace || !contractOutputDir
+    || !same(contractWorkspace, workspace) || !same(contractOutputDir, outputDir)
+    || typeof contract.audioDir !== "string" || contract.taskId !== path.basename(path.dirname(workspace))) {
+    throw new Error("任务交付契约无效或不属于当前任务");
+  }
+  if (!contract.slots.every((slot, index) => typeof slot === "string"
+    && slot.startsWith(`Clip-Studio-${contract.taskId}-${index + 1}-`)
+    && /^[a-f0-9]{8}\.mp4$/i.test(slot.slice(`Clip-Studio-${contract.taskId}-${index + 1}-`.length)))) {
+    throw new Error("任务交付文件名与任务编号不符");
+  }
+  contract.workspace = workspace;
+  contract.audioDir = await fs.realpath(contract.audioDir);
   const manifestPath = await fs.realpath(options.manifest);
   if (!inside(workspace, manifestPath)) throw new Error("渲染清单必须位于当前任务工作目录内");
   const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-  if (manifest.version !== 1 || !Array.isArray(manifest.rows) || manifest.rows.length < 1 || manifest.rows.length > 20) {
-    throw new Error("渲染清单版本或成片行数无效");
+  if (manifest.version !== 1 || !Array.isArray(manifest.rows) || manifest.rows.length !== contract.slots.length) {
+    throw new Error(`渲染清单必须恰好有 ${contract.slots.length} 条正式成片`);
   }
   if (typeof manifest.project !== "string" || path.isAbsolute(manifest.project)) throw new Error("项目路径必须相对任务工作目录");
   const project = await fs.realpath(path.resolve(workspace, manifest.project));
@@ -101,8 +268,8 @@ export async function validatedManifest(options) {
     }
     const composition = await fs.realpath(path.resolve(project, row.composition));
     if (!inside(project, composition) || !(await fs.stat(composition)).isFile()) throw new Error(`第 ${index + 1} 行的工程文件越界`);
-    if (typeof row.output !== "string" || path.isAbsolute(row.output) || path.extname(row.output).toLowerCase() !== ".mp4") {
-      throw new Error(`第 ${index + 1} 行的输出路径无效`);
+    if (row.output !== contract.slots[index]) {
+      throw new Error(`第 ${index + 1} 行输出文件名必须使用本任务预留位置：${contract.slots[index]}`);
     }
     const output = path.resolve(outputDir, row.output);
     if (!inside(outputDir, output) || output === outputDir) throw new Error(`第 ${index + 1} 行的输出路径越界`);
@@ -113,9 +280,14 @@ export async function validatedManifest(options) {
     if (existing?.isSymbolicLink()) throw new Error(`第 ${index + 1} 行的输出是符号链接`);
     if (seen.has(output.toLowerCase())) throw new Error("渲染清单有重复输出路径");
     seen.add(output.toLowerCase());
-    rows.push({ index, composition, output });
+    const audio = await validateAudio(row, composition, project, contract, settings.fps ?? 30);
+    const rowSignature = createHash("sha256").update(JSON.stringify({
+      output: row.output, composition: row.composition, audioTarget: audio.target,
+      silent: audio.silent, inputs: audio.inputs,
+    })).digest("hex");
+    rows.push({ index, composition, output, audio, rowSignature });
   }
-  return { workspace, outputDir, manifestPath, project, manifest, settings, rows };
+  return { workspace, outputDir, deliveryDir, manifestPath, project, manifest, settings, rows };
 }
 
 function cpuSnapshot() {
@@ -210,11 +382,15 @@ async function runQueue(options) {
     const entry = manifest.rows[row.index];
     const existing = await fs.stat(row.output).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
     if (existing) {
-      if (entry.status !== "running" && entry.status !== "completed") {
-        throw new Error(`第 ${row.index + 1} 条已有输出文件，但清单未记录为运行或完成；未覆盖该文件`);
+      const receipt = await readReceipt(context, row);
+      if (!receipt) {
+        throw new Error(`第 ${row.index + 1} 条交付位置已有未知文件，未覆盖该文件`);
       }
       try {
-        const verified = await verifyVideo(row.output);
+        const verified = await verifyVideo(row.output, row.audio, context.settings.fps ?? 30);
+        if (receipt && (receipt.bytes !== verified.bytes || receipt.sha256 !== await sha256(row.output))) {
+          throw new Error("完成凭据与当前成片内容不符");
+        }
         entry.status = "completed";
         entry.verified = verified;
         continue;
@@ -251,7 +427,11 @@ async function runQueue(options) {
         entry.route = "software-fallback";
         entry.fallbackReason = publicError(hardwareError.message);
       }
-      const verified = await verifyVideo(temporary);
+      await assertInputsUnchanged(row);
+      const verified = await verifyVideo(temporary, row.audio, context.settings.fps ?? 30);
+      // Receipt is durable first; the reserved filename appears only after an
+      // atomic rename. A crash in either gap never promotes an unknown file.
+      await publishReceipt(context, row, verified, temporary);
       await fs.rename(temporary, row.output);
       entry.status = "completed";
       entry.verified = verified;

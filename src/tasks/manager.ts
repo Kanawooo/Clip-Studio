@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { modelConfigFingerprint } from "../api/model-capabilities.js";
 import { SseHub } from "../api/sse.js";
+import { prepareDelivery, scanDeliveredOutputs, type DeliveryProof } from "./delivery.js";
 import { buildResumePrompt, buildTaskPrompt, type TaskExecutionPaths } from "../pi/prompt.js";
 import { resolveTaskPaths } from "../pi/task-paths.js";
 import { errorMessage, redactSecrets } from "../security.js";
@@ -55,6 +56,7 @@ interface TaskRuntime {
   secrets: string[];
   disposed: boolean;
   outputFailures: Map<string, string>;
+  deliveryProofs: Map<number, DeliveryProof>;
 }
 
 export interface TaskManagerOptions {
@@ -208,7 +210,7 @@ export class TaskManager {
       sessionDir,
       session: null,
       hub: new SseHub(),
-      outputSnapshot: await snapshotOutputDir(input.outputDir),
+      outputSnapshot: new Map(),
       outputMonitor: null,
       outputScan: null,
       promptPromise: null,
@@ -216,6 +218,7 @@ export class TaskManager {
       secrets: [input.model.apiKey].filter(Boolean),
       disposed: false,
       outputFailures: new Map(),
+      deliveryProofs: new Map(),
     };
     task.model = {
       ...task.model,
@@ -224,12 +227,13 @@ export class TaskManager {
       ...(input.model.thinking ? { verifiedThinking: input.model.thinking } : {}),
       fingerprint: modelIdentityHash(input.model),
     };
-    task.outputBaseline = [...runtime.outputSnapshot.values()];
     this.runtimes.set(taskId, runtime);
     this.persist(runtime);
     this.broadcastTask(runtime);
 
     try {
+      await prepareDelivery(task, taskDir, workspace);
+      await this.persist(runtime);
       await this.startAttempt(runtime, input, buildTaskPrompt(input, this.executionPaths(runtime)));
       return task;
     } catch (error) {
@@ -274,6 +278,7 @@ export class TaskManager {
     const resumeSessionFile = await this.safeSessionFile(runtime);
     runtime.secrets = [model.apiKey].filter(Boolean);
     runtime.disposed = false;
+    await prepareDelivery(runtime.task, runtime.taskDir, runtime.workspace);
     await this.recoverOutputs(runtime);
     await Promise.all([
       fs.mkdir(runtime.workspace, { recursive: true }),
@@ -337,6 +342,12 @@ export class TaskManager {
   private async recoverOutputs(runtime: TaskRuntime): Promise<void> {
     runtime.outputFailures.clear();
     await fs.mkdir(runtime.task.input.outputDir, { recursive: true });
+    if (runtime.task.delivery) {
+      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, true);
+      runtime.task.outputs = delivered.outputs;
+      for (const failure of delivered.failures) runtime.outputFailures.set(failure, failure);
+      return;
+    }
     const configuredOutput = path.resolve(runtime.task.input.outputDir);
     const outputRoot = await fs.realpath(runtime.task.input.outputDir);
     const known: Array<{ id: string; path: string }> = [];
@@ -406,6 +417,16 @@ export class TaskManager {
     } catch {
       // The public state is already stopped. Abort failures must not restart it.
     }
+    if (runtime.task.delivery) {
+      await runtime.outputScan?.catch(() => undefined);
+      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, true)
+        .catch(() => undefined);
+      if (delivered) {
+        runtime.task.outputs = delivered.outputs;
+        await this.persist(runtime);
+        this.broadcastTask(runtime);
+      }
+    }
     await this.disposeSession(runtime);
     return runtime.task;
   }
@@ -420,7 +441,7 @@ export class TaskManager {
     try {
       await runtime.session!.prompt(prompt);
       if (!isActive(runtime.task.status)) return;
-      await this.scanOutputs(runtime);
+      await this.scanOutputs(runtime, true);
       const found = runtime.task.outputs.length;
       if (found >= input.generateCount) {
         await this.finish(runtime, "completed", `已完成 ${found} 条成片`);
@@ -437,7 +458,7 @@ export class TaskManager {
       // Settle and retain it before persisting the failed attempt.
       await runtime.outputScan?.catch(() => undefined);
       if (!isActive(runtime.task.status)) return;
-      await this.scanOutputs(runtime).catch(() => undefined);
+      await this.scanOutputs(runtime, true).catch(() => undefined);
       if (!isActive(runtime.task.status)) return;
       const message = this.safeError(runtime, error);
       await this.finish(runtime, "failed", "制作失败", message);
@@ -467,12 +488,33 @@ export class TaskManager {
     try { await runtime.session?.abort(); } catch { /* best effort */ }
   }
 
-  private async scanOutputs(runtime: TaskRuntime): Promise<void> {
+  private async scanOutputs(runtime: TaskRuntime, force = false): Promise<void> {
     const current = runtime.outputScan;
     if (current) await current;
     if (!isActive(runtime.task.status)) return;
 
+    if (runtime.task.delivery) {
+      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, force);
+      if (!isActive(runtime.task.status)) return;
+      const before = new Set(runtime.task.outputs.map((item) => item.id));
+      const changed = delivered.outputs.length !== runtime.task.outputs.length
+        || delivered.outputs.some((item, index) => item.id !== runtime.task.outputs[index]?.id);
+      runtime.task.outputs = delivered.outputs;
+      runtime.outputFailures.clear();
+      for (const failure of delivered.failures) runtime.outputFailures.set(failure, failure);
+      if (changed) {
+        runtime.task.statusText = `已完成 ${delivered.outputs.length}/${runtime.task.input.generateCount} 条成片，Pi 仍在制作`;
+        await this.persist(runtime);
+        for (const [index, item] of delivered.outputs.entries()) if (!before.has(item.id)) {
+          runtime.hub.broadcast({ type: "output", timestamp: new Date().toISOString(), index });
+        }
+        this.broadcastTask(runtime);
+      }
+      return;
+    }
+
     const after = await snapshotOutputDir(runtime.task.input.outputDir);
+    if (!isActive(runtime.task.status)) return;
     const changed = diffVideoOutputs(runtime.outputSnapshot, after);
     runtime.outputSnapshot = after;
     const stable = await waitForStableVideoFiles(changed);
@@ -577,8 +619,17 @@ export class TaskManager {
           secrets: [],
           disposed: true,
           outputFailures: new Map(),
+          deliveryProofs: new Map(),
         };
         this.runtimes.set(task.id, runtime);
+        if (task.delivery) {
+          task.outputs = [];
+          void scanDeliveredOutputs(task, taskDir, runtime.deliveryProofs, true).then((delivered) => {
+            task.outputs = delivered.outputs;
+            for (const failure of delivered.failures) runtime.outputFailures.set(failure, failure);
+            return this.persist(runtime);
+          }).catch(() => undefined);
+        }
         if (task.error === task.statusText && task.statusText.includes("服务在任务完成前退出")) this.persist(runtime);
       } catch {
         // Invalid and legacy task files are intentionally ignored by the new UI.
@@ -603,6 +654,8 @@ export class TaskManager {
       workspace: portable(runtime.workspace),
       mediaCacheScript: portable(path.join(this.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs")),
       renderQueueScript: portable(path.join(this.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
+      hyperframesScript: portable(path.join(this.projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs")),
+      deliverySlots: runtime.task.delivery?.slots ?? [],
     };
   }
 

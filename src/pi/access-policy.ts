@@ -142,8 +142,13 @@ function inspectSegment(segment: Segment, cwd: string, boundary: Boundary): stri
       if (!readable(target, cwd, boundary)) return READ_BLOCK;
     } else if (!nullDevice(target) && !writable(target, cwd, boundary)) return WRITE_BLOCK;
   }
-  const [program, ...args] = segment.words;
+  let [program, ...args] = segment.words;
   if (!program) return COMMAND_BLOCK;
+  const skipSkillChecks = program === "HYPERFRAMES_SKIP_SKILLS=1";
+  if (skipSkillChecks) {
+    [program, ...args] = args;
+    if (executable(program ?? "") !== "node") return COMMAND_BLOCK;
+  }
   const seenFlags = new Set<string>();
   for (const arg of args) {
     const flag = arg.split("=", 1)[0]!;
@@ -161,7 +166,8 @@ function inspectSegment(segment: Segment, cwd: string, boundary: Boundary): stri
   if (READ_COMMANDS.has(name)) return inspectReadCommand(args, cwd, boundary);
   if (name === "ffprobe") return inspectFfprobe(args, cwd, boundary);
   if (name === "ffmpeg") return inspectFfmpeg(args, cwd, boundary);
-  if (name === "node") return inspectNode(args, cwd, boundary);
+  if (name === "node") return inspectNode(args, cwd, boundary, skipSkillChecks);
+  if (skipSkillChecks) return COMMAND_BLOCK;
   if (["python", "python3", "py"].includes(name)) return inspectPython(args, cwd, boundary);
   if (name === "hyperframes") return inspectHyperframes(args, cwd, boundary);
   if (name === "npx") {
@@ -228,14 +234,15 @@ function inspectFfmpeg(args: string[], cwd: string, boundary: Boundary): string 
   return undefined;
 }
 
-function inspectNode(args: string[], cwd: string, boundary: Boundary): string | undefined {
+function inspectNode(args: string[], cwd: string, boundary: Boundary, skipSkillChecks = false): string | undefined {
   if (args.length === 1 && ["--version", "-v"].includes(args[0]!)) return undefined;
   const [script, action, ...rest] = args;
   if (!script || !path.isAbsolute(script) || !action) return COMMAND_BLOCK;
   const actual = effectivePath(script);
+  if (skipSkillChecks && !sameFilePath(actual, boundary.hyperframesScript)) return COMMAND_BLOCK;
   if (sameFilePath(actual, boundary.mediaCacheScript)) return inspectMediaCache(action, rest, cwd, boundary);
   if (sameFilePath(actual, boundary.renderQueueScript)) return inspectRenderQueue(action, rest, cwd, boundary);
-  if (sameFilePath(actual, boundary.hyperframesScript)) return inspectHyperframes([action, ...rest], cwd, boundary);
+  if (sameFilePath(actual, boundary.hyperframesScript)) return inspectHyperframes([action, ...rest], cwd, boundary, skipSkillChecks);
   return COMMAND_BLOCK;
 }
 
@@ -283,9 +290,27 @@ function inspectRenderQueue(action: string, args: string[], cwd: string, boundar
   return undefined;
 }
 
-function inspectHyperframes(args: string[], cwd: string, boundary: Boundary): string | undefined {
+function inspectHyperframes(args: string[], cwd: string, boundary: Boundary, offlineInit = false): string | undefined {
   if (!existsSync(boundary.hyperframesScript)) return "本地 HyperFrames CLI 未安装，请报告组件缺失错误。";
   const [action, ...rest] = args;
+  if (action === "init") {
+    const command = `HYPERFRAMES_SKIP_SKILLS=1 node "${boundary.hyperframesScript.replace(/\\/g, "/")}" init video-project --non-interactive --example blank`;
+    if (!offlineInit) return `本地离线初始化请使用：${command}。不要执行技能更新。`;
+    const positionals = positionalArgs(rest, new Set(["--example", "--resolution"]));
+    const example = flagValue(rest, "--example");
+    const resolution = flagValue(rest, "--resolution");
+    const allowed = new Set(["--non-interactive", "--example", "--resolution"]);
+    for (let index = 0; index < rest.length; index += 1) {
+      const arg = rest[index]!;
+      if (arg === "--example" || arg === "--resolution") { index += 1; continue; }
+      if (arg.startsWith("--") && !allowed.has(arg) && !arg.startsWith("--example=") && !arg.startsWith("--resolution=")) return COMMAND_BLOCK;
+    }
+    if (!rest.includes("--non-interactive") || example !== "blank" || positionals.length !== 1
+      || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(positionals[0]!)
+      || (resolution && !["landscape", "portrait", "square", "landscape-4k", "portrait-4k", "square-4k"].includes(resolution))
+      || !pathInside(boundary.workspace, cwd)) return `初始化参数不符合当前任务本地模板要求：${command}`;
+    return undefined;
+  }
   if (!action || !HYPERFRAMES_COMMANDS.has(action)) return SETUP_BLOCK;
   const project = flagValue(rest, "--project") ?? flagValue(rest, "--dir") ?? flagValue(rest, "-d");
   if (project && !writable(project, cwd, boundary)) return WRITE_BLOCK;

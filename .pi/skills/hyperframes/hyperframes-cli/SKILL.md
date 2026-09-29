@@ -21,13 +21,26 @@ Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪�
   "project": "video-project",
   "settings": { "format": "mp4", "fps": 30, "quality": "high" },
   "rows": [
-    { "composition": "compositions/01.html", "output": "成片-01.mp4", "status": "pending" },
-    { "composition": "compositions/02.html", "output": "成片-02.mp4", "status": "pending" }
+    { "composition": "compositions/01.html", "output": "<任务提示中的第1个正式文件名>", "mainAudio": { "source": "assets/audio/voice-01.mp3" }, "status": "pending" },
+    { "composition": "compositions/02.html", "output": "<任务提示中的第2个正式文件名>", "mainAudio": { "source": "assets/audio/voice-02.mp3" }, "status": "pending" }
   ]
 }
 ```
 
-`project` 相对当前任务工作目录；`composition` 相对该工程；`output` 相对用户选择的输出目录。两处都不能跨出各自目录。工程与成片顺序由你决定，清单不保存密钥。若工作目录已有有效清单，先读它并保留已完成行，不要重写为全新清单。调用 `node <任务提示提供的渲染队列脚本绝对路径> run --manifest <清单绝对路径> --workspace <当前任务工作目录> --output-dir <用户输出目录>`，等待前台命令结束；任务 Session 的当前目录是工作目录，不能使用相对 `.pi` 路径。CLI 根据本机可用 CPU、内存和渲染进程内存调整并发；正常渲染请求 HyperFrames `--gpu`，仅硬件路径失败时对该条尝试一次软件路径。每条输出通过 FFprobe 后才记为完成。失败后再次调用同一清单只处理缺失行，已有可验证成片保持不变。不要另起 Pi Session 或安装依赖，也不要通过读取 Session 日志、其他任务或程序实现来猜测调用方式。
+`project` 相对当前任务工作目录；`composition` 相对该工程；`mainAudio.source` 若写相对路径，也相对该工程（可用音频目录中的绝对路径）。`output` 必须逐行使用任务提示给出的预留文件名，行数与要求数量完全相同；试片只能放任务工作目录。每条成片按最终选用的主音频时间线确定时长，工程中的 `<audio>` 使用同一源文件，`data-start`/`data-duration`/`data-media-start` 与清单一致。只选用完整单个音频时，上例的 `source` 即可，队列以 FFprobe 的音频完整时长为准；如裁剪、拼接或循环，改用多段：
+
+```json
+"mainAudio": { "segments": [
+  { "source": "assets/audio/voice.mp3", "from": 0, "to": 5, "at": 0 },
+  { "source": "assets/audio/voice.mp3", "from": 8, "to": 13, "at": 5 }
+] }
+```
+
+单段裁剪也可在 `mainAudio` 中直接写 `source`、`from`、`to`、`at` 和 `rate`。
+
+短音效和背景音乐不计入主音频时长。普通任务没有可用主音频时说明原因；明确要求无声且给出秒数时才可在行中使用 `silentDuration`。清单不保存密钥。若工作目录已有有效清单，先读它并保留已完成行；旧清单缺少本任务槽位或主音频时，修复清单再渲染，不直接执行。调用 `node <任务提示提供的渲染队列脚本绝对路径> run --manifest <清单绝对路径> --workspace <当前任务工作目录> --output-dir <用户输出目录>`，等待前台命令结束；任务 Session 的当前目录是工作目录，不能使用相对 `.pi` 路径。CLI 根据本机可用 CPU、内存和渲染进程内存调整并发；正常渲染请求 HyperFrames `--gpu`，仅硬件路径失败时对该条尝试一次软件路径。每条输出通过 FFprobe、主音频时长和交付凭据检查后才记为完成。失败后再次调用同一清单只处理缺失行，已有可验证成片保持不变。不要另起 Pi Session 或安装依赖，也不要通过读取 Session 日志、其他任务或程序实现来猜测调用方式。
+
+新建当前任务工程时，使用提示给出的本地 HyperFrames 脚本绝对路径，执行 `HYPERFRAMES_SKIP_SKILLS=1 node "<本地脚本>" init video-project --non-interactive --example blank`。初始化生成的技能更新建议不属于视频任务，不执行。
 
 Run commands as `npx hyperframes ...` unless project instructions provide a wrapper. Obey the wrapper when present. The CLI requires Node.js 22 or newer and FFmpeg.
 

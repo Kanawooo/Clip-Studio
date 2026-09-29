@@ -117,6 +117,8 @@ test("known CLI entries allow media analysis, local audio and render queue", () 
   assert.equal(bash(`npx hyperframes transcribe ${q(path.join(audioDir, "配乐.mp3"))} --model small --dir ${q(workspace)}`), undefined);
   assert.equal(bash(`npx hyperframes beats ${q(workspace)} --json`), undefined);
   assert.equal(bash(`npx hyperframes check --dir ${q(workspace)}`), undefined);
+  assert.equal(bash(`HYPERFRAMES_SKIP_SKILLS=1 node ${q(hyperframes)} init video-project --non-interactive --example blank`), undefined);
+  assert.equal(bash(`HYPERFRAMES_SKIP_SKILLS=1 node ${q(hyperframes)} check video-project`), undefined);
   const note = path.join(workspace, "镜头观察.txt");
   writeFileSync(note, "observation");
   assert.equal(bash(`node ${q(mediaScript)} annotate --file ${q(path.join(assetsDir, "素材.mp4"))} --kind source --text-file ${q(note)}`), undefined);
@@ -139,6 +141,11 @@ test("unknown execution, source reads, external writes and setup are stopped bef
     `cat ${q(source)}`,
     `cat ${q(outside)}`,
     `npx hyperframes doctor`,
+    `npx hyperframes init video-project --non-interactive --example blank`,
+    `node ${q(hyperframes)} init video-project --non-interactive --example blank`,
+    `HYPERFRAMES_SKIP_SKILLS=1 node ${q(hyperframes)} init video-project --non-interactive --example remote`,
+    `HYPERFRAMES_SKIP_SKILLS=1 node ${q(hyperframes)} init ../escape --non-interactive --example blank`,
+    `HYPERFRAMES_SKIP_SKILLS=1 node ${q(hyperframes)} init video-project --non-interactive --example blank --video ${q(referenceVideo)}`,
     `npm install anything`,
     `hyperframes auth login`,
     `hyperframes render --output ${q(path.join(outputDir, "wrong.mp4"))}`,

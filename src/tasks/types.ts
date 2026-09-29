@@ -55,6 +55,12 @@ export interface TaskOutput {
   path: string;
 }
 
+/** Versioned, task-owned final filenames. Legacy completed tasks omit this. */
+export interface TaskDelivery {
+  version: 1;
+  slots: string[];
+}
+
 export interface Task {
   schemaVersion: 3;
   id: string;
@@ -82,6 +88,7 @@ export interface Task {
     fingerprint?: string;
   };
   outputs: TaskOutput[];
+  delivery?: TaskDelivery;
   error?: string;
   sessionFile?: string;
   outputBaseline?: Array<{ path: string; mtimeMs: number; size: number }>;
