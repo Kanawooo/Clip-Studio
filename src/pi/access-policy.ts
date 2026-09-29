@@ -29,10 +29,11 @@ interface ShellToken {
   value: string;
 }
 
-const READ_BLOCK_REASON = "当前任务不能读取程序或依赖实现源码，请使用技能文档和公开命令帮助。";
-const WRITE_BLOCK_REASON = "当前任务只能在任务工作目录内创建或修改文件；成片请使用渲染队列输出。";
-const EXTERNAL_CWD_REASON = "外部素材目录仅用于只读检查；请回到任务工作目录运行制作命令，并传入素材绝对路径。";
-const OPAQUE_BLOCK_REASON = "当前命令无法确认写入范围，请改用路径明确的公开命令。";
+const READ_BLOCK_REASON = "该路径属于程序或其他任务，不能读取。请读取当前任务工作目录、用户提供的素材或项目本地 SKILL.md；按技能文档和任务提示使用 CLI。";
+const WRITE_BLOCK_REASON = "写入目标不在当前任务工作目录。请将工程和中间文件写入任务提示中的工作目录；最终成片通过渲染队列写入指定输出目录。";
+const EXTERNAL_CWD_REASON = "外部素材目录只允许只读检查。请在任务工作目录运行 FFmpeg 或技能 CLI，并传入素材的绝对路径。";
+const OPAQUE_BLOCK_REASON = "无法确认这条命令的写入范围。请在任务工作目录使用 Pi 原生文件工具，或直接运行技能文档中的 FFmpeg/HyperFrames CLI，并明确输入输出路径。";
+const SETUP_BLOCK_REASON = "当前视频任务不安装依赖、不更新技能或仓库。请使用已安装的 FFmpeg、HyperFrames 和项目技能；组件缺失时报告实际错误。";
 const OUTPUT_FLAGS = new Set([
   "-o", "--out", "--out-dir", "--output", "--output-dir", "--destination", "--dest", "--target-directory",
 ]);
@@ -74,7 +75,9 @@ export function createTaskAccessHandler(
       : { fingerprint, count: 1 };
     const terminate = repeatedViolation.count >= 3;
     if (terminate) options.onTermination?.(`${reason} 同一违规操作已连续重复 3 次。`);
-    return { block: true, reason, terminate };
+    return { block: true, reason: repeatedViolation.count === 2
+      ? `${reason} 同一操作再次被拦截；请按上述方式改命令，继续重复会停止任务。`
+      : reason, terminate };
   };
 }
 
@@ -231,7 +234,7 @@ function inspectCommandSegment(
   }
 
   if (isPackageMutation(command, args) || isGitMutation(command, args)) {
-    return { cwd, reason: WRITE_BLOCK_REASON };
+    return { cwd, reason: SETUP_BLOCK_REASON };
   }
 
   const scriptReason = validateTrustedNodeScript(command, args, cwd, boundary);
@@ -267,10 +270,10 @@ function validateTrustedNodeScript(
   const expectedRelative = (target: string) => path.relative(boundary.projectRoot, target).replace(/\\/g, "/").toLowerCase();
   const supplied = script.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
   if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.mediaCacheScript))) {
-    return `素材索引脚本必须使用绝对路径：${boundary.mediaCacheScript}`;
+    return `素材索引脚本不能使用相对路径。请将命令开头改为 node "${boundary.mediaCacheScript.replace(/\\/g, "/")}"，保留原子命令与参数。`;
   }
   if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.renderQueueScript))) {
-    return `渲染队列脚本必须使用绝对路径：${boundary.renderQueueScript}`;
+    return `渲染队列脚本不能使用相对路径。清单准备好后请执行：${renderQueueCommand(boundary)}`;
   }
   if (samePath(resolved, boundary.mediaCacheScript)) {
     const subcommand = args[args.indexOf(script) + 1]?.toLowerCase();
@@ -280,12 +283,19 @@ function validateTrustedNodeScript(
     return undefined;
   }
   if (samePath(resolved, boundary.renderQueueScript)) {
-    if (args[args.indexOf(script) + 1]?.toLowerCase() !== "run") return OPAQUE_BLOCK_REASON;
+    if (args[args.indexOf(script) + 1]?.toLowerCase() !== "run") {
+      return `渲染队列只支持 run。清单准备好后请执行：${renderQueueCommand(boundary)}`;
+    }
     return validateExactFlagPath(args, "--workspace", boundary.workspace, cwd)
       ?? validateExactFlagPath(args, "--output-dir", boundary.outputDir, cwd)
       ?? validateContainedFlagPath(args, "--manifest", boundary.workspace, cwd);
   }
   return undefined;
+}
+
+function renderQueueCommand(boundary: TaskAccessBoundary): string {
+  const portable = (value: string) => value.replace(/\\/g, "/");
+  return `node "${portable(boundary.renderQueueScript)}" run --manifest "${portable(path.join(boundary.workspace, "render-manifest.json"))}" --workspace "${portable(boundary.workspace)}" --output-dir "${portable(boundary.outputDir)}"`;
 }
 
 function validateExactFlagPath(
@@ -296,7 +306,7 @@ function validateExactFlagPath(
 ): string | undefined {
   const value = flagValue(args, flag);
   if (!value || containsDynamicPath(value) || !samePath(path.resolve(cwd, value), expected)) {
-    return WRITE_BLOCK_REASON;
+    return `参数 ${flag} 必须使用任务指定的绝对路径：${expected.replace(/\\/g, "/")}。请更正该参数后重试。`;
   }
   return undefined;
 }
@@ -309,7 +319,7 @@ function validateContainedFlagPath(
 ): string | undefined {
   const value = flagValue(args, flag);
   if (!value || containsDynamicPath(value) || !isInsideOrEqual(root, path.resolve(cwd, value))) {
-    return WRITE_BLOCK_REASON;
+    return `参数 ${flag} 必须指向当前任务工作目录内的文件，例如：${path.join(root, "render-manifest.json").replace(/\\/g, "/")}。`;
   }
   return undefined;
 }
@@ -329,7 +339,7 @@ function validateOutputFlags(
     const flag = equalsAt >= 0 ? arg.slice(0, equalsAt).toLowerCase() : arg.toLowerCase();
     if (!OUTPUT_FLAGS.has(flag)) continue;
     const value = equalsAt >= 0 ? arg.slice(equalsAt + 1) : args[index + 1];
-    if (!value) return OPAQUE_BLOCK_REASON;
+    if (!value) return `参数 ${flag} 缺少输出路径。请指定当前任务工作目录内的绝对文件路径。`;
     if (isRenderQueue && flag === "--output-dir") continue;
     const reason = validateWriteTarget(value, cwd, boundary);
     if (reason) return reason;
