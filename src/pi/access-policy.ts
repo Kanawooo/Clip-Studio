@@ -15,6 +15,7 @@ export interface TaskAccessPolicyOptions {
 
 interface TaskAccessBoundary {
   projectRoot: string;
+  projectRootReal: string;
   workspace: string;
   workspaceReal: string;
   outputDir: string;
@@ -30,6 +31,7 @@ interface ShellToken {
 
 const READ_BLOCK_REASON = "当前任务不能读取程序或依赖实现源码，请使用技能文档和公开命令帮助。";
 const WRITE_BLOCK_REASON = "当前任务只能在任务工作目录内创建或修改文件；成片请使用渲染队列输出。";
+const EXTERNAL_CWD_REASON = "外部素材目录仅用于只读检查；请回到任务工作目录运行制作命令，并传入素材绝对路径。";
 const OPAQUE_BLOCK_REASON = "当前命令无法确认写入范围，请改用路径明确的公开命令。";
 const OUTPUT_FLAGS = new Set([
   "-o", "--out", "--out-dir", "--output", "--output-dir", "--destination", "--dest", "--target-directory",
@@ -81,6 +83,7 @@ function createBoundary(options: TaskAccessPolicyOptions): TaskAccessBoundary {
   const workspace = path.resolve(options.workspace);
   return {
     projectRoot,
+    projectRootReal: realpathSync.native(projectRoot),
     workspace,
     workspaceReal: realpathSync.native(workspace),
     outputDir: path.resolve(options.outputDir),
@@ -204,9 +207,20 @@ function inspectCommandSegment(
     const target = args.find((arg) => !arg.startsWith("-"));
     if (!target || containsDynamicPath(target)) return { cwd, reason: OPAQUE_BLOCK_REASON };
     const resolved = path.resolve(cwd, target);
-    return isInsideOrEqual(boundary.workspace, resolved)
-      ? { cwd: resolved }
-      : { cwd, reason: WRITE_BLOCK_REASON };
+    if (isInsideOrEqual(boundary.workspace, resolved)) return { cwd: resolved };
+    try {
+      const real = realpathSync.native(resolved);
+      return samePath(real, boundary.projectRootReal)
+        || boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, real))
+        ? { cwd, reason: READ_BLOCK_REASON }
+        : { cwd: resolved };
+    } catch {
+      return { cwd, reason: OPAQUE_BLOCK_REASON };
+    }
+  }
+
+  if (!isInsideOrEqual(boundary.workspace, cwd) && !isExternalReadOnlyCommand(command, args)) {
+    return { cwd, reason: EXTERNAL_CWD_REASON };
   }
 
   if (isInlineInterpreter(command, args)) {
@@ -391,6 +405,13 @@ function isRepositoryScan(
   if (!["rg", "grep", "find", "ls", "dir", "cat", "type", "head", "tail"].includes(command)) return false;
   return args.some((arg) => pathCandidates(arg).some((candidate) =>
     !containsDynamicPath(candidate) && samePath(path.resolve(cwd, candidate), boundary.projectRoot)));
+}
+
+function isExternalReadOnlyCommand(command: string, args: string[]): boolean {
+  if (!["ls", "dir", "rg", "grep", "cat", "type", "head", "tail", "stat", "wc", "pwd", "ffprobe"].includes(command)) {
+    return false;
+  }
+  return command !== "rg" || !args.some((arg) => arg === "--pre" || arg.startsWith("--pre="));
 }
 
 function shellCommandSource(command: string, args: string[]): string | undefined {
