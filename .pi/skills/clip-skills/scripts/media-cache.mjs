@@ -231,8 +231,37 @@ async function listMedia(dir, extensions) {
   return files.sort();
 }
 
+// Give Pi task-local pictures. The shared cache remains an internal CLI detail;
+// native Pi reads never need access to observations from another task.
+export async function materializeTaskView(item, workspace, kind) {
+  const workspaceReal = await fs.realpath(workspace);
+  const viewDir = path.join(workspaceReal, "media-views", createHash("sha256").update(kind).update(item.directory).digest("hex"));
+  await fs.mkdir(viewDir, { recursive: true });
+  const realViewDir = await fs.realpath(viewDir);
+  const relative = path.relative(workspaceReal, realViewDir);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("素材视图目录离开当前任务工作目录");
+  }
+  const localCopy = async (name) => {
+    const target = path.join(viewDir, name);
+    const existing = await fs.lstat(target).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    if (existing?.isSymbolicLink()) throw new Error("素材视图不能覆盖符号链接");
+    await fs.copyFile(path.join(item.directory, name), target);
+    return target;
+  };
+  const frames = await Promise.all(item.frames.map(async (frame) => ({ at: frame.at, path: await localCopy(frame.name) })));
+  const sheets = await Promise.all(item.sheets.map(async (entry) => ({ ...entry, path: await localCopy(entry.name) })));
+  const entry = await localCopy("entry.json");
+  return {
+    source: item.source, cacheHit: item.cacheHit, duration: item.duration,
+    geometry: item.geometry, observation: item.observation, transcript: item.transcript,
+    frames, sheets, entry,
+  };
+}
+
 async function indexTask(options) {
   if (!options.workspace) throw new Error("index 需要 --workspace 以保存素材索引");
+  const workspace = await fs.realpath(options.workspace);
   const reference = await cacheFile(path.resolve(options.reference), "reference");
   const videos = await listMedia(path.resolve(options.assets), VIDEO_EXT);
   const audio = await listMedia(path.resolve(options.audio), AUDIO_EXT);
@@ -240,16 +269,11 @@ async function indexTask(options) {
   for (const file of videos) sources.push(await cacheFile(file, "source"));
   const sounds = [];
   for (const file of audio) sounds.push(await cacheFile(file, "audio"));
-  const compact = (item) => ({
-    source: item.source, cacheHit: item.cacheHit, duration: item.duration,
-    geometry: item.geometry, observation: item.observation, transcript: item.transcript,
-    frames: item.frames.map((frame) => ({ at: frame.at, path: path.join(item.directory, frame.name) })),
-    sheets: item.sheets.map((entry) => ({ ...entry, path: path.join(item.directory, entry.name) })),
-    entry: path.join(item.directory, "entry.json"),
-  });
-  const result = { reference: compact(reference), sources: sources.map(compact), audio: sounds.map(compact) };
-  const workspace = path.resolve(options.workspace);
-  await fs.mkdir(workspace, { recursive: true });
+  const result = {
+    reference: await materializeTaskView(reference, workspace, "reference"),
+    sources: await Promise.all(sources.map((item) => materializeTaskView(item, workspace, "source"))),
+    audio: await Promise.all(sounds.map((item) => materializeTaskView(item, workspace, "audio"))),
+  };
   const indexFile = path.join(workspace, "media-index.json");
   await fs.writeFile(indexFile, JSON.stringify(result, null, 2));
   return { indexFile, sourceCount: sources.length, audioCount: sounds.length,
@@ -259,7 +283,7 @@ async function indexTask(options) {
 async function annotate(options) {
   const item = await cacheFile(path.resolve(options.file), options.kind || "source");
   const entryFile = path.join(item.directory, "entry.json");
-  const value = await fs.readFile(options.textFile, "utf8");
+  const value = await fs.readFile(options["text-file"] ?? options.textFile, "utf8");
   if (value.length > 100_000) throw new Error("观察记录过长");
   if (/\b(?:sk-[A-Za-z0-9_-]{8,}|authorization\s*:|api[_-]?key\s*[:=])/i.test(value)) {
     throw new Error("观察记录包含疑似密钥，拒绝写入共享缓存");

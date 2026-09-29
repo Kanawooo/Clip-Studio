@@ -28,8 +28,12 @@ export interface PiVideoSession {
 
 export interface PiVideoSessionOptions {
   projectRoot: string;
+  tasksDir?: string;
   agentDir: string;
   workspace: string;
+  referenceVideo: string;
+  assetsDir: string;
+  audioDir: string;
   outputDir: string;
   sessionDir?: string;
   resumeSessionFile?: string;

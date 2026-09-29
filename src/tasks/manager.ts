@@ -5,6 +5,7 @@ import path from "node:path";
 import { modelConfigFingerprint } from "../api/model-capabilities.js";
 import { SseHub } from "../api/sse.js";
 import { buildResumePrompt, buildTaskPrompt, type TaskExecutionPaths } from "../pi/prompt.js";
+import { resolveTaskPaths } from "../pi/task-paths.js";
 import { errorMessage, redactSecrets } from "../security.js";
 import {
   diffVideoOutputs,
@@ -90,8 +91,12 @@ export class TaskManager {
       const { createPiVideoSession } = await import("../pi/session.js");
       const sessionOptions = {
         projectRoot: this.projectRoot,
+        tasksDir: this.tasksDir,
         agentDir: this.agentDir,
         workspace,
+        referenceVideo: input.referenceVideo,
+        assetsDir: input.assetsDir,
+        audioDir: input.audioDir,
         outputDir: input.outputDir,
         sessionDir: start.sessionDir,
         model: input.model,
@@ -167,11 +172,13 @@ export class TaskManager {
     const taskDir = path.join(this.tasksDir, taskId);
     const workspace = path.join(taskDir, "workspace");
     const sessionDir = path.join(taskDir, "session");
+    this.validateTaskPaths(input, workspace);
     await Promise.all([
       fs.mkdir(workspace, { recursive: true }),
       fs.mkdir(sessionDir, { recursive: true }),
       fs.mkdir(input.outputDir, { recursive: true }),
     ]);
+    this.validateTaskPaths(input, workspace);
 
     const now = new Date().toISOString();
     const task: Task = {
@@ -263,6 +270,7 @@ export class TaskManager {
       },
       modelCapabilityId: "",
     };
+    this.validateTaskPaths(input, runtime.workspace);
     const resumeSessionFile = await this.safeSessionFile(runtime);
     runtime.secrets = [model.apiKey].filter(Boolean);
     runtime.disposed = false;
@@ -271,6 +279,7 @@ export class TaskManager {
       fs.mkdir(runtime.workspace, { recursive: true }),
       fs.mkdir(runtime.sessionDir, { recursive: true }),
     ]);
+    this.validateTaskPaths(input, runtime.workspace);
     runtime.task.status = "pending";
     runtime.task.statusText = "正在继续原任务";
     runtime.task.error = undefined;
@@ -595,6 +604,18 @@ export class TaskManager {
       mediaCacheScript: portable(path.join(this.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs")),
       renderQueueScript: portable(path.join(this.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
     };
+  }
+
+  private validateTaskPaths(input: CreateTaskInput, workspace: string): void {
+    try {
+      resolveTaskPaths({
+        projectRoot: this.projectRoot, tasksDir: this.tasksDir, workspace,
+        referenceVideo: input.referenceVideo, assetsDir: input.assetsDir,
+        audioDir: input.audioDir, outputDir: input.outputDir,
+      });
+    } catch (error) {
+      throw new TaskCreateError(sanitizePublicText(redactSecrets(errorMessage(error), [input.model.apiKey])), 400);
+    }
   }
 
   private safeError(runtime: TaskRuntime, error: unknown): string {

@@ -1,505 +1,373 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
-import type {
-  InlineExtension,
-  ToolCallEvent,
-  ToolCallEventResult,
-} from "@earendil-works/pi-coding-agent";
+import type { InlineExtension, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import {
+  effectivePath, pathInside, resolveTaskPaths, sameFilePath,
+  type TaskPathOptions, type TaskPaths,
+} from "./task-paths.js";
 
-export interface TaskAccessPolicyOptions {
-  projectRoot: string;
-  workspace: string;
-  outputDir: string;
+export interface TaskAccessPolicyOptions extends TaskPathOptions {
   onTermination?: (reason: string) => void;
 }
 
-interface TaskAccessBoundary {
-  projectRoot: string;
-  projectRootReal: string;
-  workspace: string;
-  workspaceReal: string;
-  outputDir: string;
-  blockedReadRoots: string[];
+interface Boundary extends TaskPaths {
   mediaCacheScript: string;
   renderQueueScript: string;
+  hyperframesScript: string;
+  audioDataScript: string;
 }
 
-interface ShellToken {
-  kind: "word" | "operator";
-  value: string;
-}
+interface Token { kind: "word" | "operator"; value: string }
+interface Segment { words: string[]; redirects: Array<{ operator: string; target: string }> }
 
-const READ_BLOCK_REASON = "该路径属于程序或其他任务，不能读取。请读取当前任务工作目录、用户提供的素材或项目本地 SKILL.md；按技能文档和任务提示使用 CLI。";
-const WRITE_BLOCK_REASON = "写入目标不在当前任务工作目录。请将工程和中间文件写入任务提示中的工作目录；最终成片通过渲染队列写入指定输出目录。";
-const EXTERNAL_CWD_REASON = "外部素材目录只允许只读检查。请在任务工作目录运行 FFmpeg 或技能 CLI，并传入素材的绝对路径。";
-const OPAQUE_BLOCK_REASON = "无法确认这条命令的写入范围。请在任务工作目录使用 Pi 原生文件工具，或直接运行技能文档中的 FFmpeg/HyperFrames CLI，并明确输入输出路径。";
-const SETUP_BLOCK_REASON = "当前视频任务不安装依赖、不更新技能或仓库。请使用已安装的 FFmpeg、HyperFrames 和项目技能；组件缺失时报告实际错误。";
-const OUTPUT_FLAGS = new Set([
-  "-o", "--out", "--out-dir", "--output", "--output-dir", "--destination", "--dest", "--target-directory",
-]);
-const PACKAGE_COMMANDS = new Set(["npm", "pnpm", "yarn", "bun", "npx", "pip", "pip3", "uv"]);
-const FILE_MUTATION_COMMANDS = new Set([
-  "rm", "unlink", "rmdir", "mkdir", "touch", "truncate", "chmod", "chown",
-  "del", "erase", "md", "rd", "ren", "rename",
-]);
+const READ_BLOCK = "该路径不属于当前任务可读范围。请读取本任务工作目录、四个已选路径或项目本地技能文档；缓存图片由素材索引复制到工作目录。";
+const WRITE_BLOCK = "写入目标不在当前任务工作目录。请将工程和中间文件写入任务工作目录；最终成片由渲染队列写入指定输出目录。";
+const COMMAND_BLOCK = "无法确认该命令的访问范围。请使用 Pi 原生文件工具，或直接调用已安装的 FFmpeg/FFprobe、素材索引及 HyperFrames CLI；脚本必须使用已核对的本地绝对入口。";
+const SETUP_BLOCK = "视频任务不安装、更新、认证或发布。请使用已安装的剪辑组件；缺失时报告实际错误。";
+const HYPERFRAMES_COMMANDS = new Set(["lint", "check", "beats", "transcribe", "keyframes", "compositions", "info", "catalog"]);
+const READ_COMMANDS = new Set(["ls", "dir", "rg", "grep", "find", "cat", "type", "head", "tail", "stat", "wc", "pwd"]);
+const MUTATION_COMMANDS = new Set(["mkdir", "md", "touch", "rm", "del", "erase", "rmdir", "rd", "cp", "copy", "mv", "move"]);
+const OUTPUT_FLAGS = new Set(["-o", "--out", "--output", "--out-dir", "--output-dir", "--dest", "--destination"]);
+const MEDIA_EXTENSIONS = /\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|m4a|wav|aac|flac|ogg|srt|vtt|json|jpg|jpeg|png|webp|cube|txt|html)$/i;
+const SKILL_READ_EXTENSIONS = new Set([".md", ".txt", ".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp"]);
+const SINGLE_USE_FLAGS = new Set(["--workspace", "--output-dir", "--manifest", "--reference", "--assets", "--audio", "--file", "--text-file", "--textFile", "--project", "--dir", "-d", "--output", "-o", "--out"]);
+const ALIAS_GROUPS = [["--project", "--dir", "-d"], ["--output", "--out", "-o"], ["--text-file", "--textFile"]];
 
 export function createTaskAccessPolicy(options: TaskAccessPolicyOptions): InlineExtension {
   const handler = createTaskAccessHandler(options);
-  return {
-    name: "task-access-policy",
-    hidden: true,
-    factory: (pi) => {
-      pi.on("tool_call", handler);
-    },
-  };
+  return { name: "task-access-policy", hidden: true, factory: (pi) => { pi.on("tool_call", handler); } };
 }
 
-/** Stateful handler exported for deterministic policy tests. */
-export function createTaskAccessHandler(
-  options: TaskAccessPolicyOptions,
-): (event: ToolCallEvent) => ToolCallEventResult | undefined {
-  const boundary = createBoundary(options);
-  let repeatedViolation: { fingerprint: string; count: number } | undefined;
+/** Stateful handler exported for deterministic, command-free policy tests. */
+export function createTaskAccessHandler(options: TaskAccessPolicyOptions): (event: ToolCallEvent) => ToolCallEventResult | undefined {
+  const paths = resolveTaskPaths(options);
+  const boundary: Boundary = {
+    ...paths,
+    mediaCacheScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs")),
+    renderQueueScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
+    hyperframesScript: effectivePath(path.join(paths.projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs")),
+    audioDataScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-creative", "scripts", "extract-audio-data.py")),
+  };
+  let repeated: { key: string; count: number } | undefined;
   return (event) => {
-    const reason = taskAccessViolation(event, boundary);
-    if (!reason) {
-      // Any permitted operation proves that the session is still making a
-      // valid workflow decision. Never let an earlier denied lookup poison a
-      // later analysis, authoring or render step.
-      repeatedViolation = undefined;
-      return undefined;
-    }
-    const fingerprint = violationFingerprint(event, reason);
-    repeatedViolation = repeatedViolation?.fingerprint === fingerprint
-      ? { fingerprint, count: repeatedViolation.count + 1 }
-      : { fingerprint, count: 1 };
-    const terminate = repeatedViolation.count >= 3;
+    const reason = violation(event, boundary);
+    if (!reason) { repeated = undefined; return undefined; }
+    const key = `${event.toolName}\n${reason}\n${JSON.stringify(event.input)}`;
+    repeated = repeated?.key === key ? { key, count: repeated.count + 1 } : { key, count: 1 };
+    const terminate = repeated.count >= 3;
     if (terminate) options.onTermination?.(`${reason} 同一违规操作已连续重复 3 次。`);
-    return { block: true, reason: repeatedViolation.count === 2
-      ? `${reason} 同一操作再次被拦截；请按上述方式改命令，继续重复会停止任务。`
-      : reason, terminate };
+    return {
+      block: true,
+      reason: repeated.count === 2 ? `${reason} 同一操作再次被拦截；请换用上述方式，继续重复会停止任务。` : reason,
+      terminate,
+    };
   };
 }
 
-function createBoundary(options: TaskAccessPolicyOptions): TaskAccessBoundary {
-  const projectRoot = path.resolve(options.projectRoot);
-  const workspace = path.resolve(options.workspace);
-  return {
-    projectRoot,
-    projectRootReal: realpathSync.native(projectRoot),
-    workspace,
-    workspaceReal: realpathSync.native(workspace),
-    outputDir: path.resolve(options.outputDir),
-    blockedReadRoots: [
-      "node_modules",
-      "src",
-      "tests",
-      "scripts",
-      "dist",
-      path.join("web", "src"),
-      ".git",
-      ".codex",
-      ".trellis",
-      path.join("data", "tasks"),
-    ].map((entry) => path.resolve(projectRoot, entry)),
-    mediaCacheScript: path.resolve(projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs"),
-    renderQueueScript: path.resolve(projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs"),
-  };
-}
-
-function taskAccessViolation(event: ToolCallEvent, boundary: TaskAccessBoundary): string | undefined {
+function violation(event: ToolCallEvent, boundary: Boundary): string | undefined {
   const input = event.input as Record<string, unknown>;
-  if (event.toolName === "bash") {
-    const command = typeof input.command === "string" ? input.command : "";
-    return bashAccessViolation(command, boundary);
-  }
-
+  if (event.toolName === "bash") return bashViolation(typeof input.command === "string" ? input.command : "", boundary);
   const candidate = toolPath(input);
   if (event.toolName === "write" || event.toolName === "edit") {
-    if (!candidate) return WRITE_BLOCK_REASON;
-    const resolved = path.resolve(boundary.workspace, candidate);
-    return isSafeWorkspaceTarget(resolved, boundary) ? undefined : WRITE_BLOCK_REASON;
+    return candidate && writable(candidate, boundary.workspace, boundary) ? undefined : WRITE_BLOCK;
   }
-
-  if (!candidate) return undefined;
-  const resolved = path.resolve(boundary.workspace, candidate);
-  if (isInsideOrEqual(boundary.workspace, resolved)) return undefined;
-  if (["grep", "find", "ls"].includes(event.toolName) && samePath(resolved, boundary.projectRoot)) {
-    return READ_BLOCK_REASON;
-  }
-  return boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, resolved))
-    ? READ_BLOCK_REASON
-    : undefined;
-}
-
-function bashAccessViolation(
-  command: string,
-  boundary: TaskAccessBoundary,
-  initialCwd = boundary.workspace,
-): string | undefined {
-  if (!command.trim()) return undefined;
-  const inspectedCommand = unwrapOuterSubshell(command);
-  const tokens = tokenizeShell(inspectedCommand);
-  if (!tokens || hasOpaqueShellSyntax(inspectedCommand)) return OPAQUE_BLOCK_REASON;
-
-  let cwd = initialCwd;
-  let segment: string[] = [];
-  for (let index = 0; index <= tokens.length; index += 1) {
-    const token = tokens[index];
-    if (!token || (token.kind === "operator" && isControlOperator(token.value))) {
-      if (segment.length > 0) {
-        const result = inspectCommandSegment(segment, cwd, boundary);
-        if (result.reason) return result.reason;
-        cwd = result.cwd;
-        segment = [];
-      }
-      continue;
-    }
-    if (token.kind === "operator" && isRedirection(token.value)) {
-      const target = tokens[index + 1];
-      if (!target || target.kind !== "word") return OPAQUE_BLOCK_REASON;
-      if (!isFileDescriptor(target.value)) {
-        const reason = token.value.includes(">")
-          ? validateWriteTarget(target.value, cwd, boundary)
-          : validateReadTarget(target.value, cwd, boundary);
-        if (reason) return reason;
-      }
-      index += 1;
-      continue;
-    }
-    segment.push(token.value);
+  if (["read", "grep", "find", "ls"].includes(event.toolName)) {
+    return !candidate || readable(candidate, boundary.workspace, boundary) ? undefined : READ_BLOCK;
   }
   return undefined;
 }
 
-function inspectCommandSegment(
-  words: string[],
-  cwd: string,
-  boundary: TaskAccessBoundary,
-): { cwd: string; reason?: string } {
-  const commandIndex = words.findIndex((word) => !isEnvironmentAssignment(word));
-  if (commandIndex < 0) return { cwd };
-  const commandWord = words[commandIndex]!;
-  const command = executableName(commandWord);
-  const args = words.slice(commandIndex + 1);
-
-  const protectedReason = explicitProtectedPath(words, cwd, boundary);
-  if (protectedReason) return { cwd, reason: protectedReason };
-
-  if (isRepositoryScan(command, args, cwd, boundary)) return { cwd, reason: READ_BLOCK_REASON };
-
-  if (["env", "command"].includes(command)) {
-    const nestedIndex = args.findIndex((arg) => !arg.startsWith("-") && !isEnvironmentAssignment(arg));
-    return nestedIndex < 0
-      ? { cwd, reason: OPAQUE_BLOCK_REASON }
-      : inspectCommandSegment(args.slice(nestedIndex), cwd, boundary);
-  }
-
-  if (["if", "then", "fi", "for", "while", "until", "case", "select", "do", "done", "function"].includes(command)) {
-    return { cwd, reason: OPAQUE_BLOCK_REASON };
-  }
-
-  if (["bash", "sh", "cmd"].includes(command)) {
-    const source = shellCommandSource(command, args);
-    return { cwd, reason: source && !containsDynamicPath(source)
-      ? bashAccessViolation(source, boundary, cwd)
-      : OPAQUE_BLOCK_REASON };
-  }
-
-  if (command === "cd") {
-    const target = args.find((arg) => !arg.startsWith("-"));
-    if (!target || containsDynamicPath(target)) return { cwd, reason: OPAQUE_BLOCK_REASON };
-    const resolved = path.resolve(cwd, target);
-    if (isInsideOrEqual(boundary.workspace, resolved)) return { cwd: resolved };
-    try {
-      const real = realpathSync.native(resolved);
-      return samePath(real, boundary.projectRootReal)
-        || boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, real))
-        ? { cwd, reason: READ_BLOCK_REASON }
-        : { cwd: resolved };
-    } catch {
-      return { cwd, reason: OPAQUE_BLOCK_REASON };
-    }
-  }
-
-  if (!isInsideOrEqual(boundary.workspace, cwd) && !isExternalReadOnlyCommand(command, args)) {
-    return { cwd, reason: EXTERNAL_CWD_REASON };
-  }
-
-  if (isInlineInterpreter(command, args)) {
-    const source = inlineSource(args);
-    if (!source || args.some((arg) => arg.toLowerCase() === "-encodedcommand") || inlineCodeMayMutate(source)) {
-      return { cwd, reason: OPAQUE_BLOCK_REASON };
-    }
-  }
-
-  if (isPackageMutation(command, args) || isGitMutation(command, args)) {
-    return { cwd, reason: SETUP_BLOCK_REASON };
-  }
-
-  const scriptReason = validateTrustedNodeScript(command, args, cwd, boundary);
-  if (scriptReason) return { cwd, reason: scriptReason };
-
-  const outputReason = validateOutputFlags(args, cwd, boundary, command, words);
-  if (outputReason) return { cwd, reason: outputReason };
-
-  if (command === "ffmpeg") {
-    const reason = validateFfmpegOutputs(args, cwd, boundary);
-    if (reason) return { cwd, reason };
-  }
-
-  const mutationTargets = fileMutationTargets(command, args);
-  for (const target of mutationTargets) {
-    const reason = validateWriteTarget(target, cwd, boundary);
-    if (reason) return { cwd, reason };
-  }
-
-  return { cwd };
+function readable(value: string, cwd: string, boundary: Boundary): boolean {
+  if (dynamic(value) || protocol(value)) return false;
+  try {
+    const resolved = path.resolve(cwd, value);
+    const actual = effectivePath(resolved);
+    if ([boundary.workspace, boundary.referenceVideo, boundary.assetsDir, boundary.audioDir, boundary.outputDir]
+      .some((root) => pathInside(root, actual))) return true;
+    return boundary.skillRoots.some((root) => {
+      if (!pathInside(root, resolved) || !pathInside(root, actual)) return false;
+      const relative = path.relative(root, actual).replace(/\\/g, "/").toLowerCase();
+      if (/(^|\/)(scripts?|tests?|fixtures?|node_modules|\.git)(\/|$)/.test(relative)) return false;
+      if (!existsSync(resolved)) return false;
+      const stat = statSync(resolved);
+      return stat.isDirectory() || SKILL_READ_EXTENSIONS.has(path.extname(actual).toLowerCase());
+    });
+  } catch { return false; }
 }
 
-function validateTrustedNodeScript(
-  command: string,
-  args: string[],
-  cwd: string,
-  boundary: TaskAccessBoundary,
-): string | undefined {
-  if (command !== "node") return undefined;
-  const script = args.find((arg) => !arg.startsWith("-"));
-  if (!script || script === "-") return undefined;
-  const resolved = path.resolve(cwd, script);
-  const expectedRelative = (target: string) => path.relative(boundary.projectRoot, target).replace(/\\/g, "/").toLowerCase();
-  const supplied = script.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-  if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.mediaCacheScript))) {
-    return `素材索引脚本不能使用相对路径。请将命令开头改为 node "${boundary.mediaCacheScript.replace(/\\/g, "/")}"，保留原子命令与参数。`;
+function writable(value: string, cwd: string, boundary: Boundary): boolean {
+  if (dynamic(value) || protocol(value)) return false;
+  try {
+    const resolved = path.resolve(cwd, value);
+    return pathInside(boundary.workspace, resolved) && pathInside(boundary.workspace, effectivePath(resolved));
+  } catch { return false; }
+}
+
+function bashViolation(command: string, boundary: Boundary): string | undefined {
+  if (!command.trim()) return COMMAND_BLOCK;
+  if (/[`\x00]|\$\(|\$\{|\$[A-Za-z0-9_@*?]|<\(|>\(|\\\r?\n/.test(command)) return COMMAND_BLOCK;
+  const tokens = tokenize(command);
+  if (!tokens) return COMMAND_BLOCK;
+  let cwd = boundary.workspace;
+  let remaining = tokens;
+  const firstAnd = tokens.findIndex((item) => item.kind === "operator" && item.value === "&&");
+  if (firstAnd >= 0) {
+    const cd = parseSegment(tokens.slice(0, firstAnd));
+    if (!cd || cd.redirects.length || cd.words.length !== 2 || cd.words[0]?.toLowerCase() !== "cd") return COMMAND_BLOCK;
+    const target = path.resolve(cwd, cd.words[1]!);
+    if (!readable(target, cwd, boundary) || !existsSync(target) || !statSync(target).isDirectory()) return READ_BLOCK;
+    cwd = effectivePath(target);
+    remaining = tokens.slice(firstAnd + 1);
   }
-  if (!path.isAbsolute(script) && supplied.endsWith(expectedRelative(boundary.renderQueueScript))) {
-    return `渲染队列脚本不能使用相对路径。清单准备好后请执行：${renderQueueCommand(boundary)}`;
+  if (remaining.some((item) => item.kind === "operator" && [";", "&&", "||", "&", "<<", "&>"].includes(item.value))) return COMMAND_BLOCK;
+  const pipe = remaining.findIndex((item) => item.kind === "operator" && item.value === "|");
+  const left = parseSegment(pipe < 0 ? remaining : remaining.slice(0, pipe));
+  if (!left || !left.words.length) return COMMAND_BLOCK;
+  const reason = inspectSegment(left, cwd, boundary);
+  if (reason) return reason;
+  if (pipe < 0) return undefined;
+  if (remaining.slice(pipe + 1).some((item) => item.kind === "operator" && item.value === "|")) return COMMAND_BLOCK;
+  const right = parseSegment(remaining.slice(pipe + 1));
+  if (!right || right.redirects.length || !READ_COMMANDS.has(executable(left.words[0]!))
+    && !["ffmpeg", "ffprobe"].includes(executable(left.words[0]!))) return COMMAND_BLOCK;
+  if (!right.words.length || !["grep", "rg", "head", "tail", "wc"].includes(executable(right.words[0]!))) return COMMAND_BLOCK;
+  if (left.redirects.some((item) => item.operator !== "2>&1")) return COMMAND_BLOCK;
+  return inspectReadCommand(right.words.slice(1), cwd, boundary, true);
+}
+
+function inspectSegment(segment: Segment, cwd: string, boundary: Boundary): string | undefined {
+  for (const { operator, target } of segment.redirects) {
+    if (operator === "2>&1") continue;
+    if (operator.includes("<")) {
+      if (!readable(target, cwd, boundary)) return READ_BLOCK;
+    } else if (!nullDevice(target) && !writable(target, cwd, boundary)) return WRITE_BLOCK;
   }
-  if (samePath(resolved, boundary.mediaCacheScript)) {
-    const subcommand = args[args.indexOf(script) + 1]?.toLowerCase();
-    if (["index", "detail", "window", "resheet"].includes(subcommand ?? "")) {
-      return validateExactFlagPath(args, "--workspace", boundary.workspace, cwd);
+  const [program, ...args] = segment.words;
+  if (!program) return COMMAND_BLOCK;
+  const seenFlags = new Set<string>();
+  for (const arg of args) {
+    const flag = arg.split("=", 1)[0]!;
+    if (!SINGLE_USE_FLAGS.has(flag)) continue;
+    if (seenFlags.has(flag)) return COMMAND_BLOCK;
+    seenFlags.add(flag);
+  }
+  if (ALIAS_GROUPS.some((group) => group.filter((flag) => seenFlags.has(flag)).length > 1)) return COMMAND_BLOCK;
+  const name = executable(program);
+  if (!pathInside(boundary.workspace, cwd) && !READ_COMMANDS.has(name) && name !== "ffprobe") {
+    return "当前目录是只读媒体目录。请切回任务工作目录运行 FFmpeg 或本地技能 CLI，并传入媒体绝对路径。";
+  }
+  if (path.isAbsolute(program) && !["ffmpeg", "ffprobe", "node", "python", "python3", "py", "hyperframes"]
+    .some((allowed) => name === allowed && trustedExecutable(program, allowed, boundary))) return COMMAND_BLOCK;
+  if (READ_COMMANDS.has(name)) return inspectReadCommand(args, cwd, boundary);
+  if (name === "ffprobe") return inspectFfprobe(args, cwd, boundary);
+  if (name === "ffmpeg") return inspectFfmpeg(args, cwd, boundary);
+  if (name === "node") return inspectNode(args, cwd, boundary);
+  if (["python", "python3", "py"].includes(name)) return inspectPython(args, cwd, boundary);
+  if (name === "hyperframes") return inspectHyperframes(args, cwd, boundary);
+  if (name === "npx") {
+    const rest = args[0] === "--no-install" ? args.slice(1) : args;
+    return rest[0] === "hyperframes" ? inspectHyperframes(rest.slice(1), cwd, boundary) : SETUP_BLOCK;
+  }
+  if (MUTATION_COMMANDS.has(name)) return inspectMutation(name, args, cwd, boundary);
+  if (["npm", "pnpm", "yarn", "bun", "pip", "pip3", "uv", "git"].includes(name)) return SETUP_BLOCK;
+  return COMMAND_BLOCK;
+}
+
+function trustedExecutable(program: string, name: string, boundary: Boundary): boolean {
+  const configured = name === "ffmpeg" ? process.env.HYPERFRAMES_FFMPEG_PATH
+    : name === "ffprobe" ? process.env.HYPERFRAMES_FFPROBE_PATH
+      : name === "node" ? process.execPath : undefined;
+  if (configured && sameFilePath(effectivePath(program), effectivePath(configured))) return true;
+  if (name === "hyperframes") return sameFilePath(effectivePath(program), effectivePath(path.join(boundary.projectRoot, "node_modules", ".bin", "hyperframes.cmd")));
+  return false;
+}
+
+function inspectReadCommand(args: string[], cwd: string, boundary: Boundary, pipeTail = false): string | undefined {
+  if (args.some((arg) => /^(?:--pre(?:=|$)|-exec(?:dir)?$|-ok(?:dir)?$|-delete$|-f$|--file$|--files-from$)/i.test(arg))) return COMMAND_BLOCK;
+  if (pipeTail) return args.some((arg) => !arg.startsWith("-") && (looksPath(arg, cwd) || arg.includes("/"))) ? COMMAND_BLOCK : undefined;
+  for (const arg of args) {
+    if (arg.startsWith("-") || arg === "-" || arg === ".") continue;
+    if (looksPath(arg, cwd) && !readable(arg, cwd, boundary)) return READ_BLOCK;
+  }
+  return undefined;
+}
+
+function inspectFfprobe(args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (args.includes("-show_private_data") || args.includes("-f") || args.includes("-protocol_whitelist")) return COMMAND_BLOCK;
+  const output = flagValue(args, "-o") ?? flagValue(args, "--output");
+  if (output && !writable(output, cwd, boundary)) return WRITE_BLOCK;
+  const input = flagValue(args, "-i");
+  if (input && !readable(input, cwd, boundary)) return READ_BLOCK;
+  for (const arg of args) {
+    if (arg.startsWith("-") || arg === output || arg === input || arg.includes("=")) continue;
+    if (looksPath(arg, cwd) && !readable(arg, cwd, boundary)) return READ_BLOCK;
+  }
+  return undefined;
+}
+
+function inspectFfmpeg(args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (args.some((arg) => /(?:^|[,;])(?:a?movie|subtitles|fontfile|textfile|lut3d)=/i.test(arg)
+    || /^(?:https?|rtsp|rtmp|ftp|udp|tcp|file|concat|crypto|pipe):/i.test(arg))) return COMMAND_BLOCK;
+  if (args.some((arg, index) => arg === "-f" && ["tee", "hls", "dash"].includes(args[index + 1] ?? ""))
+    || args.some((arg) => ["-hls_segment_filename", "-segment_list", "-progress"].includes(arg))) return COMMAND_BLOCK;
+  const inputIndexes = new Set<number>();
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (["-i", "-filter_script", "-filter_complex_script", "-attach"].includes(args[index]!)) inputIndexes.add(index + 1);
+  }
+  for (const index of inputIndexes) {
+    const value = args[index]!;
+    if (value.includes("=") && args[index - 1] === "-i" && ["color", "anullsrc", "testsrc", "sine", "aevalsrc"]
+      .some((source) => value.startsWith(`${source}=`))) continue;
+    if (!readable(value, cwd, boundary)) return READ_BLOCK;
+  }
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (inputIndexes.has(index) || arg.startsWith("-") || arg.includes("=") || arg === "-" || nullDevice(arg)) continue;
+    if (looksPath(arg, cwd) && !writable(arg, cwd, boundary)) return WRITE_BLOCK;
+  }
+  return undefined;
+}
+
+function inspectNode(args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (args.length === 1 && ["--version", "-v"].includes(args[0]!)) return undefined;
+  const [script, action, ...rest] = args;
+  if (!script || !path.isAbsolute(script) || !action) return COMMAND_BLOCK;
+  const actual = effectivePath(script);
+  if (sameFilePath(actual, boundary.mediaCacheScript)) return inspectMediaCache(action, rest, cwd, boundary);
+  if (sameFilePath(actual, boundary.renderQueueScript)) return inspectRenderQueue(action, rest, cwd, boundary);
+  if (sameFilePath(actual, boundary.hyperframesScript)) return inspectHyperframes([action, ...rest], cwd, boundary);
+  return COMMAND_BLOCK;
+}
+
+function inspectPython(args: string[], cwd: string, boundary: Boundary): string | undefined {
+  const [script, input, ...rest] = args;
+  if (!script || !path.isAbsolute(script) || !sameFilePath(effectivePath(script), boundary.audioDataScript)) return COMMAND_BLOCK;
+  if (!input || !readable(input, cwd, boundary)) return READ_BLOCK;
+  const output = flagValue(rest, "-o") ?? flagValue(rest, "--output");
+  return output && writable(output, cwd, boundary) ? undefined : WRITE_BLOCK;
+}
+
+function inspectMediaCache(action: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (!["index", "annotate", "detail", "window", "resheet", "check-plan"].includes(action)) return COMMAND_BLOCK;
+  if (action === "index") {
+    for (const [flag, expected] of [["--reference", boundary.referenceVideo], ["--assets", boundary.assetsDir],
+      ["--audio", boundary.audioDir], ["--workspace", boundary.workspace]] as const) {
+      const value = flagValue(args, flag);
+      if (!value || !sameFilePath(effectivePath(path.resolve(cwd, value)), expected)) return `${flag} 必须指向本任务指定路径：${expected}。`;
     }
     return undefined;
   }
-  if (samePath(resolved, boundary.renderQueueScript)) {
-    if (args[args.indexOf(script) + 1]?.toLowerCase() !== "run") {
-      return `渲染队列只支持 run。清单准备好后请执行：${renderQueueCommand(boundary)}`;
-    }
-    return validateExactFlagPath(args, "--workspace", boundary.workspace, cwd)
-      ?? validateExactFlagPath(args, "--output-dir", boundary.outputDir, cwd)
-      ?? validateContainedFlagPath(args, "--manifest", boundary.workspace, cwd);
+  if (action !== "check-plan" && action !== "annotate") {
+    const workspace = flagValue(args, "--workspace");
+    if (!workspace || !sameFilePath(effectivePath(path.resolve(cwd, workspace)), boundary.workspace)) return WRITE_BLOCK;
   }
+  const file = flagValue(args, "--file");
+  if (!file || !readable(file, cwd, boundary)) return READ_BLOCK;
+  if (action === "annotate") {
+    const textFile = flagValue(args, "--text-file") ?? flagValue(args, "--textFile");
+    if (!textFile || !pathInside(boundary.workspace, effectivePath(path.resolve(cwd, textFile)))) return READ_BLOCK;
+  }
+  const output = flagValue(args, "--output");
+  return output && !writable(output, cwd, boundary) ? WRITE_BLOCK : undefined;
+}
+
+function inspectRenderQueue(action: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (action !== "run") return `渲染队列只支持 run：${renderCommand(boundary)}`;
+  const flags = [["--workspace", boundary.workspace], ["--output-dir", boundary.outputDir]] as const;
+  for (const [flag, expected] of flags) {
+    const value = flagValue(args, flag);
+    if (!value || !sameFilePath(effectivePath(path.resolve(cwd, value)), expected)) return `${flag} 必须指向本任务指定路径：${expected}。`;
+  }
+  const manifest = flagValue(args, "--manifest");
+  if (!manifest || !writable(manifest, cwd, boundary)) return `渲染清单必须位于当前任务工作目录：${renderCommand(boundary)}`;
   return undefined;
 }
 
-function renderQueueCommand(boundary: TaskAccessBoundary): string {
-  const portable = (value: string) => value.replace(/\\/g, "/");
-  return `node "${portable(boundary.renderQueueScript)}" run --manifest "${portable(path.join(boundary.workspace, "render-manifest.json"))}" --workspace "${portable(boundary.workspace)}" --output-dir "${portable(boundary.outputDir)}"`;
-}
-
-function validateExactFlagPath(
-  args: string[],
-  flag: string,
-  expected: string,
-  cwd: string,
-): string | undefined {
-  const value = flagValue(args, flag);
-  if (!value || containsDynamicPath(value) || !samePath(path.resolve(cwd, value), expected)) {
-    return `参数 ${flag} 必须使用任务指定的绝对路径：${expected.replace(/\\/g, "/")}。请更正该参数后重试。`;
-  }
-  return undefined;
-}
-
-function validateContainedFlagPath(
-  args: string[],
-  flag: string,
-  root: string,
-  cwd: string,
-): string | undefined {
-  const value = flagValue(args, flag);
-  if (!value || containsDynamicPath(value) || !isInsideOrEqual(root, path.resolve(cwd, value))) {
-    return `参数 ${flag} 必须指向当前任务工作目录内的文件，例如：${path.join(root, "render-manifest.json").replace(/\\/g, "/")}。`;
-  }
-  return undefined;
-}
-
-function validateOutputFlags(
-  args: string[],
-  cwd: string,
-  boundary: TaskAccessBoundary,
-  command: string,
-  words: string[],
-): string | undefined {
-  const isRenderQueue = command === "node"
-    && words.some((word) => samePath(path.resolve(cwd, word), boundary.renderQueueScript));
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]!;
-    const equalsAt = arg.indexOf("=");
-    const flag = equalsAt >= 0 ? arg.slice(0, equalsAt).toLowerCase() : arg.toLowerCase();
-    if (!OUTPUT_FLAGS.has(flag)) continue;
-    const value = equalsAt >= 0 ? arg.slice(equalsAt + 1) : args[index + 1];
-    if (!value) return `参数 ${flag} 缺少输出路径。请指定当前任务工作目录内的绝对文件路径。`;
-    if (isRenderQueue && flag === "--output-dir") continue;
-    const reason = validateWriteTarget(value, cwd, boundary);
-    if (reason) return reason;
-    if (equalsAt < 0) index += 1;
-  }
-  return undefined;
-}
-
-function validateFfmpegOutputs(args: string[], cwd: string, boundary: TaskAccessBoundary): string | undefined {
-  const inputs = new Set<number>();
-  for (let index = 0; index < args.length - 1; index += 1) {
-    if (["-i", "-filter_script", "-filter_complex_script"].includes(args[index] ?? "")) inputs.add(index + 1);
-  }
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index]!;
-    if (inputs.has(index) || arg.startsWith("-") || !looksLikeStandaloneOutput(arg)) continue;
-    const reason = validateWriteTarget(arg, cwd, boundary);
-    if (reason) return reason;
-  }
-  return undefined;
-}
-
-function fileMutationTargets(command: string, args: string[]): string[] {
-  const positional = args.filter((arg) => !arg.startsWith("-") && !isFileDescriptor(arg));
-  if (FILE_MUTATION_COMMANDS.has(command)) return positional;
-  if (command === "ln") return positional;
-  if (["cp", "copy", "mv", "move", "install"].includes(command)) {
-    const targetFlag = flagValue(args, "-t") ?? flagValue(args, "--target-directory");
-    return targetFlag ? [targetFlag] : positional.slice(-1);
-  }
-  if (command === "tee") return positional;
-  if (command === "sed" && args.some((arg) => arg === "-i" || arg.startsWith("-i"))) return positional.slice(-1);
-  if (command === "perl" && args.some((arg) => /^-.*i/.test(arg))) return positional;
-  return [];
-}
-
-function validateWriteTarget(value: string, cwd: string, boundary: TaskAccessBoundary): string | undefined {
-  if (isNullDevice(value)) return undefined;
-  if (containsDynamicPath(value)) return OPAQUE_BLOCK_REASON;
-  return isSafeWorkspaceTarget(path.resolve(cwd, value), boundary) ? undefined : WRITE_BLOCK_REASON;
-}
-
-function validateReadTarget(value: string, cwd: string, boundary: TaskAccessBoundary): string | undefined {
-  if (isNullDevice(value)) return undefined;
-  if (containsDynamicPath(value)) return OPAQUE_BLOCK_REASON;
-  const resolved = path.resolve(cwd, value);
-  return boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, resolved))
-    ? READ_BLOCK_REASON
-    : undefined;
-}
-
-function explicitProtectedPath(words: string[], cwd: string, boundary: TaskAccessBoundary): string | undefined {
-  for (const word of words) {
-    for (const candidate of pathCandidates(word)) {
-      if (containsDynamicPath(candidate)) continue;
-      const resolved = path.resolve(cwd, candidate);
-      if (isInsideOrEqual(boundary.workspace, resolved)) continue;
-      if (boundary.blockedReadRoots.some((root) => isInsideOrEqual(root, resolved))) return READ_BLOCK_REASON;
-    }
-    if (/(?:^|[\\/])\.\.[\\/](?:\.\.[\\/])*(?:src|tests|scripts|dist|node_modules)(?:[\\/]|$)/i.test(word)) {
-      return READ_BLOCK_REASON;
+function inspectHyperframes(args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (!existsSync(boundary.hyperframesScript)) return "本地 HyperFrames CLI 未安装，请报告组件缺失错误。";
+  const [action, ...rest] = args;
+  if (!action || !HYPERFRAMES_COMMANDS.has(action)) return SETUP_BLOCK;
+  const project = flagValue(rest, "--project") ?? flagValue(rest, "--dir") ?? flagValue(rest, "-d");
+  if (project && !writable(project, cwd, boundary)) return WRITE_BLOCK;
+  const output = [...OUTPUT_FLAGS].map((flag) => flagValue(rest, flag)).find(Boolean);
+  if (output && !writable(output, cwd, boundary)) return WRITE_BLOCK;
+  if (action === "transcribe") {
+    const input = positionalArgs(rest, new Set(["--dir", "-d", "--engine", "-e", "--model", "-m", "--language", "-l", "--to", "--output", "-o", "--timeout"]))[0];
+    if (!input || !readable(input, cwd, boundary)) return READ_BLOCK;
+    // By default transcribe writes beside the input. Keep that inside the task.
+    if (!project && !writable(path.dirname(path.resolve(cwd, input)), cwd, boundary)) {
+      return `转写外部音频时请加 --dir "${boundary.workspace}"，将字幕输出写在任务工作目录。`;
     }
   }
+  if (action === "beats") {
+    const target = positionalArgs(rest, new Set<string>())[0] ?? cwd;
+    if (!writable(target, cwd, boundary)) return WRITE_BLOCK;
+  }
+  for (const arg of rest) {
+    if (arg.startsWith("-") || arg === project || arg === output || arg.includes("=")) continue;
+    if (looksPath(arg, cwd) && !readable(arg, cwd, boundary)) return READ_BLOCK;
+  }
   return undefined;
 }
 
-function isRepositoryScan(
-  command: string,
-  args: string[],
-  cwd: string,
-  boundary: TaskAccessBoundary,
-): boolean {
-  if (!["rg", "grep", "find", "ls", "dir", "cat", "type", "head", "tail"].includes(command)) return false;
-  return args.some((arg) => pathCandidates(arg).some((candidate) =>
-    !containsDynamicPath(candidate) && samePath(path.resolve(cwd, candidate), boundary.projectRoot)));
-}
-
-function isExternalReadOnlyCommand(command: string, args: string[]): boolean {
-  if (!["ls", "dir", "rg", "grep", "cat", "type", "head", "tail", "stat", "wc", "pwd", "ffprobe"].includes(command)) {
-    return false;
+function inspectMutation(name: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
+  const paths = args.filter((arg) => !arg.startsWith("-"));
+  if (!paths.length) return COMMAND_BLOCK;
+  if (["cp", "copy", "mv", "move"].includes(name)) {
+    if (paths.length !== 2) return COMMAND_BLOCK;
+    if (!(name === "cp" || name === "copy" ? readable(paths[0]!, cwd, boundary) : writable(paths[0]!, cwd, boundary))) return READ_BLOCK;
+    return writable(paths[1]!, cwd, boundary) ? undefined : WRITE_BLOCK;
   }
-  return command !== "rg" || !args.some((arg) => arg === "--pre" || arg.startsWith("--pre="));
+  for (const target of paths) {
+    if (!writable(target, cwd, boundary) || sameFilePath(effectivePath(path.resolve(cwd, target)), boundary.workspace)) return WRITE_BLOCK;
+  }
+  return undefined;
 }
 
-function shellCommandSource(command: string, args: string[]): string | undefined {
-  const commandFlag = args.findIndex((arg) => command === "cmd"
-    ? arg.toLowerCase() === "/c"
-    : /^-[a-z]*c[a-z]*$/i.test(arg));
-  return commandFlag >= 0 ? args[commandFlag + 1] : undefined;
+function parseSegment(tokens: Token[]): Segment | undefined {
+  const words: string[] = [], redirects: Segment["redirects"] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.kind === "word") { words.push(token.value); continue; }
+    if (token.value === "2>&1") { redirects.push({ operator: token.value, target: "1" }); continue; }
+    if (!/^(?:\d)?(?:>|>>|<)$/.test(token.value)) return undefined;
+    const target = tokens[++index];
+    if (!target || target.kind !== "word") return undefined;
+    redirects.push({ operator: token.value, target: target.value });
+  }
+  return { words, redirects };
 }
 
-function pathCandidates(word: string): string[] {
-  const candidates = [word];
-  const equalsAt = word.indexOf("=");
-  if (equalsAt >= 0 && equalsAt < word.length - 1) candidates.push(word.slice(equalsAt + 1));
-  return candidates.filter((value) => value.startsWith(".") || path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value));
-}
-
-function tokenizeShell(command: string): ShellToken[] | undefined {
-  const tokens: ShellToken[] = [];
-  let word = "";
-  let quote: "'" | "\"" | undefined;
-  const flush = () => {
-    if (!word) return;
-    tokens.push({ kind: "word", value: word });
-    word = "";
-  };
-
+function tokenize(command: string): Token[] | undefined {
+  const tokens: Token[] = [];
+  let word = "", quote: "'" | '"' | undefined;
+  const flush = () => { if (word) { tokens.push({ kind: "word", value: word }); word = ""; } };
   for (let index = 0; index < command.length; index += 1) {
     const char = command[index]!;
     if (quote) {
       if (char === quote) quote = undefined;
-      else if (char === "\\" && quote === "\"" && command[index + 1] === "\"") {
-        word += "\"";
-        index += 1;
-      } else word += char;
+      else if (char === "\\" && quote === '"' && command[index + 1] === '"') { word += '"'; index += 1; }
+      else word += char;
       continue;
     }
-    if (char === "'" || char === "\"") {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) {
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (/\s/.test(char)) { flush(); if (char === "\n" || char === "\r") tokens.push({ kind: "operator", value: ";" }); continue; }
+    if (char === "&" || char === ";" || char === "|") {
       flush();
-      if (char === "\n" || char === "\r") tokens.push({ kind: "operator", value: ";" });
-      continue;
-    }
-    if (char === ";" || char === "|") {
-      flush();
-      const doubled = command[index + 1] === char;
-      tokens.push({ kind: "operator", value: doubled ? char + char : char });
-      if (doubled) index += 1;
-      continue;
-    }
-    if (char === "&") {
-      flush();
-      let operator = char;
-      if (command[index + 1] === "&" || command[index + 1] === ">") {
-        operator += command[index + 1];
-        index += 1;
-      }
-      if (operator === "&>" && command[index + 1] === ">") {
-        operator += ">";
-        index += 1;
-      }
-      tokens.push({ kind: "operator", value: operator });
+      const twice = command[index + 1] === char;
+      tokens.push({ kind: "operator", value: twice ? char + char : char });
+      if (twice) index += 1;
       continue;
     }
     if (char === ">" || char === "<") {
-      let descriptor = "";
-      if (/^\d$/.test(word)) {
-        descriptor = word;
-        word = "";
-      } else flush();
-      let operator = descriptor + char;
-      if (command[index + 1] === char) {
-        operator += char;
-        index += 1;
+      const descriptor = /^\d$/.test(word) ? word : "";
+      if (descriptor) word = ""; else flush();
+      if (descriptor === "2" && char === ">" && command.slice(index + 1, index + 3) === "&1") {
+        tokens.push({ kind: "operator", value: "2>&1" }); index += 2; continue;
       }
-      tokens.push({ kind: "operator", value: operator });
+      const twice = command[index + 1] === char;
+      tokens.push({ kind: "operator", value: descriptor + char + (twice ? char : "") });
+      if (twice) index += 1;
       continue;
     }
     word += char;
@@ -509,106 +377,9 @@ function tokenizeShell(command: string): ShellToken[] | undefined {
   return tokens;
 }
 
-function isControlOperator(value: string): boolean {
-  return value === ";" || value === "|" || value === "||" || value === "&" || value === "&&";
-}
-
-function isRedirection(value: string): boolean {
-  return /^(?:\d|&)?(?:>|>>|<|<<)$/.test(value);
-}
-
-function hasOpaqueShellSyntax(command: string): boolean {
-  return /<\(|>\(|\beval\b|(?:^|[;&|]\s*)[({]|\w+\s*\(\)\s*\{/.test(command);
-}
-
-function isEnvironmentAssignment(value: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(value);
-}
-
-function executableName(value: string): string {
-  return path.basename(value.replace(/\\/g, "/")).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
-}
-
-function violationFingerprint(event: ToolCallEvent, reason: string): string {
-  return `${event.toolName}\n${reason}\n${JSON.stringify(event.input)}`;
-}
-
-function unwrapOuterSubshell(command: string): string {
-  const trimmed = command.trim();
-  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) return trimmed;
-  let quote: "'" | "\"" | undefined;
-  let depth = 0;
-  for (let index = 0; index < trimmed.length; index += 1) {
-    const char = trimmed[index]!;
-    if (quote) {
-      if (char === quote) quote = undefined;
-      else if (char === "\\" && quote === "\"") index += 1;
-      continue;
-    }
-    if (char === "'" || char === "\"") {
-      quote = char;
-      continue;
-    }
-    if (char === "(") depth += 1;
-    else if (char === ")") depth -= 1;
-    if (depth === 0 && index < trimmed.length - 1) return trimmed;
-    if (depth < 0) return trimmed;
-  }
-  return depth === 0 ? trimmed.slice(1, -1).trim() : trimmed;
-}
-
-function isInlineInterpreter(command: string, args: string[]): boolean {
-  if (command === "node") return args.includes("-e") || args.includes("--eval");
-  if (["python", "python3", "py", "perl", "ruby"].includes(command)) return args.includes("-c") || args.includes("-e");
-  if (["powershell", "pwsh"].includes(command)) return args.some((arg) => ["-c", "-command", "-encodedcommand"].includes(arg.toLowerCase()));
-  if (["bash", "sh", "cmd"].includes(command)) return args.some((arg) => ["-c", "/c"].includes(arg.toLowerCase()));
-  return false;
-}
-
-function inlineSource(args: string[]): string | undefined {
-  const index = args.findIndex((arg) => ["-e", "--eval", "-c", "/c", "-command", "-encodedcommand"].includes(arg.toLowerCase()));
-  return index >= 0 ? args[index + 1] : undefined;
-}
-
-function inlineCodeMayMutate(source: string): boolean {
-  return /\b(?:writeFile|appendFile|rename|unlink|remove|replace|rm|rmdir|mkdir|copyFile|link|symlink|chmod|chown|truncate)(?:Sync)?\b|\bcreateWriteStream\b|\b(?:spawn|exec|execFile|system|popen|mklink|del|erase|copy|move|ren)\b|\bopen\s*\([^)]*["'](?:w|a|x)\b|\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Copy-Item|New-Item)\b/i.test(source);
-}
-
-function isPackageMutation(command: string, args: string[]): boolean {
-  if (!PACKAGE_COMMANDS.has(command)) return false;
-  const action = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
-  return action === "install" || action === "add" || action === "remove" || action === "uninstall"
-    || action === "update" || action === "upgrade" || action === "link" || action === "exec";
-}
-
-function isGitMutation(command: string, args: string[]): boolean {
-  if (command !== "git") return false;
-  const action = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
-  return Boolean(action && !["--version", "status", "log", "show", "diff", "rev-parse"].includes(action));
-}
-
-function flagValue(args: string[], flag: string): string | undefined {
-  const exact = args.indexOf(flag);
-  if (exact >= 0) return args[exact + 1];
-  const prefix = `${flag}=`;
-  return args.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
-}
-
-function looksLikeStandaloneOutput(value: string): boolean {
-  if (value === "-" || value.includes("=")) return false;
-  return /(?:^|[\\/])[^\\/]+\.[A-Za-z0-9%]{1,8}$/.test(value) || /^[^\\/]+\.[A-Za-z0-9%]{1,8}$/.test(value);
-}
-
-function containsDynamicPath(value: string): boolean {
-  return /\x60|\$\(|\$\{|\$[A-Za-z_]|\x00/.test(value);
-}
-
-function isFileDescriptor(value: string): boolean {
-  return /^&?\d+$/.test(value) || value === "-";
-}
-
-function isNullDevice(value: string): boolean {
-  return /^(?:\/dev\/null|nul)$/i.test(value);
+function renderCommand(boundary: Boundary): string {
+  const portable = (value: string) => value.replace(/\\/g, "/");
+  return `node "${portable(boundary.renderQueueScript)}" run --manifest "${portable(path.join(boundary.workspace, "render-manifest.json"))}" --workspace "${portable(boundary.workspace)}" --output-dir "${portable(boundary.outputDir)}"`;
 }
 
 function toolPath(input: Record<string, unknown>): string | undefined {
@@ -619,30 +390,31 @@ function toolPath(input: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function samePath(left: string, right: string): boolean {
-  return normalizePath(left) === normalizePath(right);
+function executable(value: string): string {
+  return path.basename(value.replace(/\\/g, "/")).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
 }
 
-function normalizePath(value: string): string {
-  return path.resolve(value).replace(/\\/g, "/").toLowerCase();
+function flagValue(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  if (index >= 0) return args[index + 1];
+  const prefix = `${flag}=`;
+  return args.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
 }
 
-function isSafeWorkspaceTarget(candidate: string, boundary: TaskAccessBoundary): boolean {
-  if (!isInsideOrEqual(boundary.workspace, candidate)) return false;
-  let existing = candidate;
-  while (!existsSync(existing)) {
-    const parent = path.dirname(existing);
-    if (parent === existing) return false;
-    existing = parent;
+function positionalArgs(args: string[], valueFlags: Set<string>): string[] {
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (valueFlags.has(arg)) { index += 1; continue; }
+    if (!arg.startsWith("-") && ![...valueFlags].some((flag) => arg.startsWith(`${flag}=`))) positional.push(arg);
   }
-  try {
-    return isInsideOrEqual(boundary.workspaceReal, realpathSync.native(existing));
-  } catch {
-    return false;
-  }
+  return positional;
 }
 
-function isInsideOrEqual(root: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+function dynamic(value: string): boolean { return /[`\x00]|\$\(|\$\{|\$[A-Za-z0-9_@*?]/.test(value); }
+function protocol(value: string): boolean { return /^(?:https?|rtsp|ftp|file|concat|crypto|pipe):/i.test(value); }
+function nullDevice(value: string): boolean { return /^(?:nul|\/dev\/null)$/i.test(value); }
+function looksPath(value: string, cwd: string): boolean {
+  return path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith(".")
+    || MEDIA_EXTENSIONS.test(value) || existsSync(path.resolve(cwd, value));
 }

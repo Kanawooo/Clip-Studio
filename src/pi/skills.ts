@@ -40,8 +40,12 @@ function isUnderPath(filePath: string, dir: string): boolean {
 
 export interface ProjectResourceLoaderOptions {
   projectRoot: string;
+  tasksDir?: string;
   agentDir: string;
   workspace: string;
+  referenceVideo: string;
+  assetsDir: string;
+  audioDir: string;
   outputDir: string;
   onPolicyTermination?: (reason: string) => void;
 }
