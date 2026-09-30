@@ -170,6 +170,7 @@ export class TaskManager {
   }
 
   private async createReservedTask(input: CreateTaskInput): Promise<Task> {
+    input = { ...input, reuseVisualAnalysis: input.reuseVisualAnalysis === true };
     const taskId = randomUUID();
     const taskDir = path.join(this.tasksDir, taskId);
     const workspace = path.join(taskDir, "workspace");
@@ -196,6 +197,7 @@ export class TaskManager {
         outputDir: input.outputDir,
         taskRequest: input.taskRequest,
         generateCount: input.generateCount,
+        reuseVisualAnalysis: input.reuseVisualAnalysis,
       },
       model: { provider: input.model.provider, model: input.model.model },
       outputs: [],
@@ -385,6 +387,16 @@ export class TaskManager {
   }
 
   private async startAttempt(runtime: TaskRuntime, input: CreateTaskInput, prompt: string | ((restored: boolean) => string), resumeSessionFile?: string): Promise<void> {
+    await atomicWrite(path.join(runtime.workspace, "media-policy.json"), {
+      version: 1,
+      taskId: runtime.task.id,
+      reuseVisualAnalysis: runtime.task.input.reuseVisualAnalysis ?? true,
+      inputs: {
+        referenceVideo: runtime.task.input.referenceVideo,
+        assetsDir: runtime.task.input.assetsDir,
+        audioDir: runtime.task.input.audioDir,
+      },
+    });
     runtime.session = await this.sessionFactory(input, runtime.workspace, {
       taskId: runtime.task.id, taskDir: runtime.taskDir, sessionDir: runtime.sessionDir, resumeSessionFile,
     });
@@ -725,6 +737,7 @@ function parsePersistedTask(json: string): Task | undefined {
     || typeof value.input.outputDir !== "string"
     || typeof value.input.taskRequest !== "string"
     || !Number.isInteger(value.input.generateCount)
+    || (value.input.reuseVisualAnalysis !== undefined && typeof value.input.reuseVisualAnalysis !== "boolean")
     || !value.model
     || typeof value.model.provider !== "string"
     || typeof value.model.model !== "string"

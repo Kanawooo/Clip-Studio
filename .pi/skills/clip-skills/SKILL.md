@@ -7,15 +7,19 @@ description: 面向 AI Agent 的视频剪辑技能套件，把各大剪辑博主
 
 ## Clip Studio 本地素材复用
 
-在 Clip Studio 视频任务中，先用 `node <任务提示提供的素材索引脚本绝对路径> index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立 `media-index.json`。任务 Session 的当前目录是工作目录，不能使用相对 `.pi` 路径。命令只读取媒体、抽帧与生成宫格；缓存位于程序的 `.runtime/media-cache/v1`，不会替你选镜头。参考片每秒取样，长素材默认每三秒取样，短素材更密；实际参考要求、节奏判断和选材方案每个任务重新做。
+在 Clip Studio 视频任务中，先用 `node <任务提示提供的素材索引脚本绝对路径> index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立素材索引。任务 Session 的当前目录是工作目录，脚本使用任务提示给出的绝对入口。参考片每秒取样，长素材默认每三秒取样，短素材更密；参考节奏和本次选材由你判断。
 
-索引中的 `cacheHit` 表示文件身份及版本未变，可直接复用 FFprobe 信息、画面、来源中立的观察和转写。新文件或变化文件才重新提取。看不清的候选区间用 `detail --file <视频> --at <秒> --workspace <当前任务工作目录> --output <该目录中的图片>` 定点取图；`--original` 才输出原始长边。模型缩小或拒绝大宫格时，只读较少帧或用 detail 检查，画面不得拉伸。
+先读取命令返回的 `overviewFile`。它列出源文件、时长、宫格路径和分析状态；更多素材用 `overview --workspace <工作目录> --offset 25 --limit 25` 分页查看，候选详情用 `entry --file <视频> --kind source --workspace <工作目录>`。完整 `media-index.json` 供 CLI 维护，概览无需展开每张高清帧的路径。独立的原生工具调用可同轮提交，已完成信息在本 Session 内供所有成片和续作使用。
 
-需要检查连续候选片段时，用 `window --file <视频> --start <秒> --end <秒> --workspace <当前任务工作目录>` 只对该区间每秒取样，不重新扫描素材目录。
+`cacheHit` 表示基础媒体文件身份未变。FFprobe、高清帧、宫格和匹配配置的转写继续复用。`workspace/media-policy.json` 是任务的只读配置：默认关闭跨任务 AI 画面分析复用，新任务仍独立看缓存图片；开启时，中立描述帮助找候选，选用画面仍读取对应宫格或局部图。参考判断每个任务重做，同任务观察可继续使用。`absent/partial/incompatible` 表示分析缺失、不完整或失效；文字覆盖范围之外的素材需要看图补充判断。
 
-若模型服务缩小或拒绝大宫格，用 `resheet --file <视频> --kind source --workspace <当前任务工作目录> --batch-size 9 --max-sheet 2048` 从已缓存的帧拆出较小宫格；这些参数可按服务实际情况调整，无须再解码原视频。
+概览是最长边 2000 以内的 JPEG，按实际显示比例、旋转及像素宽高比自动布局和拆页。候选细节用 `detail --file <视频> --at <秒> --workspace <工作目录> --output <工作目录中的图片>`，`--original` 输出原始长边；连续候选用 `window --file <视频> --start <秒> --end <秒> --workspace <工作目录>` 每秒检查局部区间。`resheet --file <视频> --kind source --workspace <工作目录> --batch-size 9 --max-sheet 2000` 从已有帧重组较小宫格。
 
-把与当前参考无关的镜头内容/时间区间描述写进任务工作目录的 UTF-8 文本后，使用 `annotate --file <视频> --kind source --text-file <文本>` 保存，下次任务可复用；音频转写可用 `--kind audio --transcript`。不要存参考片评分、选镜排序、成片方案、密钥。多成片方案可写为 `{"outputs":[{"shots":[{"source":"绝对路径","start":0,"end":5}]}]}`，调用 `check-plan --file <方案 JSON>` 检查重复开场和长片段重叠；素材确实不足时可传 `--allow-reuse`，由你做最终选择。
+已有中立画面观察与实际转写一次批量保存：在工作目录写 `{"version":1,"rows":[{"file":"源文件绝对路径","kind":"source","observation":{"text":"已看到的内容","coverage":[[0,3]],"complete":false}}]}`，用 `annotate-batch --workspace <工作目录> --manifest <该 JSON>`。音频行可填写 `kind:"audio"` 和 `transcript`。`complete:true` 需要 coverage 覆盖整段媒体；局部观察保持 partial。缓存记录只保存源内容、时间区间和转写。单条已有文字可用 `annotate --file <媒体> --kind source --text-file <工作目录中的 UTF-8 文本>`，转写加 `--transcript`。
+
+需要转写的独立音频可统一写为 `{"version":1,"rows":[{"file":"音频绝对路径","kind":"audio"}]}`，用 `transcribe-batch --workspace <工作目录> --manifest <清单 JSON>`，按本机 CPU/可用内存并行并自动保存结果；使用已安装的 Whisper 与模型，默认 small.en。可通过 `--model`、`--language` 选择本机已有的配置，相同源文件及配置才复用完整转写。纯音乐无需语音转写。
+
+多成片方案可写为 `{"outputs":[{"shots":[{"source":"绝对路径","start":0,"end":5}]}]}`，调用 `check-plan --file <方案 JSON>` 检查重复开场和长片段重叠；素材确实不足时可传 `--allow-reuse`，由你做最终选择。
 
 Clip Studio 的 Pi 任务始终在本 Session 内完成，不派生软件子 Agent。
 

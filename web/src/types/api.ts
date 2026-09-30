@@ -32,6 +32,7 @@ export interface CreateTaskInput {
   outputDir: string;
   taskRequest: string;
   generateCount: number;
+  reuseVisualAnalysis?: boolean;
   model: ModelConfig;
   modelCapabilityId: string;
 }
@@ -50,6 +51,7 @@ export interface Task {
     outputDir: string;
     taskRequest: string;
     generateCount: number;
+    reuseVisualAnalysis?: boolean;
   };
   model: { provider: string; model: string; thinkingLevel?: ModelThinkingLevel };
   startedAt?: string | null;
@@ -149,4 +151,5 @@ export interface TaskDraft {
   outputDir: string;
   taskRequest: string;
   generateCount: number;
+  reuseVisualAnalysis: boolean;
 }

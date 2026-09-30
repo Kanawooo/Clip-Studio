@@ -15,6 +15,32 @@ const MiB = 1024 * 1024;
 let interrupted = false;
 const children = new Set();
 
+export class ManifestValidationError extends Error {
+  constructor(code, field, message, correction) {
+    super(`[VALIDATION:${code}] ${field}：${message}。${correction}`);
+    this.name = "ManifestValidationError";
+    this.code = code;
+    this.field = field;
+  }
+}
+
+function invalid(code, field, message, correction = "请修正该字段后调用同一清单；已有成片保持不变。") {
+  throw new ManifestValidationError(code, field, message, correction);
+}
+
+async function existingFieldPath(candidate, root, field, type) {
+  let actual;
+  try { actual = await fs.realpath(candidate); }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    invalid("PATH_MISSING", field, `路径不存在：${candidate}`, `请先在任务工作目录准备对应${type === "directory" ? "工程目录" : "文件"}，然后填写相对路径。`);
+  }
+  if (!inside(root, actual) || (type === "directory" ? !(await fs.stat(actual)).isDirectory() : !(await fs.stat(actual)).isFile())) {
+    invalid("PATH_ROLE", field, "路径越界或文件类型不符", "工程和 composition 必须位于当前任务工作目录内，不能指向程序实现或其他任务。");
+  }
+  return actual;
+}
+
 export function shouldAdmit({ active, logicalCpus, cpuBusy, freeBytes, totalBytes, observedWorkerBytes }) {
   if (active === 0) return true;
   const reserve = Math.max(512 * MiB, totalBytes * 0.1);
@@ -216,10 +242,8 @@ async function assertInputsUnchanged(row) {
   }
 }
 
-export async function validatedManifest(options) {
-  if (!options.manifest || !options.workspace || !options["output-dir"]) {
-    throw new Error("run 需要 --manifest、--workspace 和 --output-dir");
-  }
+async function deliveryContext(options) {
+  if (!options.workspace || !options["output-dir"]) throw new Error("需要 --workspace 和 --output-dir 指向本任务工作目录及输出目录");
   const workspace = await fs.realpath(options.workspace);
   const outputDir = await fs.realpath(options["output-dir"]);
   const deliveryDir = await fs.realpath(path.join(workspace, "..", "delivery"));
@@ -243,33 +267,82 @@ export async function validatedManifest(options) {
   }
   contract.workspace = workspace;
   contract.audioDir = await fs.realpath(contract.audioDir);
-  const manifestPath = await fs.realpath(options.manifest);
-  if (!inside(workspace, manifestPath)) throw new Error("渲染清单必须位于当前任务工作目录内");
-  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-  if (manifest.version !== 1 || !Array.isArray(manifest.rows) || manifest.rows.length !== contract.slots.length) {
-    throw new Error(`渲染清单必须恰好有 ${contract.slots.length} 条正式成片`);
+  return { workspace, outputDir, deliveryDir, contract };
+}
+
+/** A schema-correct starting point; creative inputs stay with Pi. Existing
+ * manifests are never overwritten, so a retry cannot erase completed rows. */
+export async function createManifestTemplate(options) {
+  if (!options.manifest) throw new Error("template 需要 --manifest 指向新清单文件");
+  const context = await deliveryContext(options);
+  const candidate = path.resolve(options.manifest);
+  const parent = await fs.realpath(path.dirname(candidate));
+  const file = path.join(parent, path.basename(candidate));
+  if (!inside(context.workspace, parent) || same(file, path.join(context.workspace, "media-policy.json"))) {
+    throw new Error("模板必须写入当前任务工作目录中的新 JSON 文件，不能写入任务配置");
   }
-  if (typeof manifest.project !== "string" || path.isAbsolute(manifest.project)) throw new Error("项目路径必须相对任务工作目录");
-  const project = await fs.realpath(path.resolve(workspace, manifest.project));
-  if (!inside(workspace, project) || !(await fs.stat(project)).isDirectory()) throw new Error("工程路径离开任务工作目录");
+  const project = options.project ?? "video-project";
+  if (typeof project !== "string" || path.isAbsolute(project) || !inside(context.workspace, path.resolve(context.workspace, project))) {
+    throw new Error("template --project 必须相对当前任务工作目录");
+  }
+  const manifest = {
+    version: 1, project, settings: { format: "mp4", fps: 30, quality: "high" },
+    rows: context.contract.slots.map((output, index) => ({
+      composition: `compositions/${String(index + 1).padStart(2, "0")}.html`, output,
+      ...(context.contract.silentDuration ? { silentDuration: context.contract.silentDuration } : { mainAudio: { source: "" } }),
+      status: "pending",
+    })),
+  };
+  try { await fs.writeFile(file, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" }); }
+  catch (error) {
+    if (error.code === "EEXIST") throw new Error("清单已存在，未覆盖。请读取并修正已有清单，保留已完成行；不要重新生成模板。");
+    throw error;
+  }
+  return { manifest: file, rows: manifest.rows.length, next: "填写工程、composition 和 mainAudio.source；保持 version、rows 和 output 正式槽位不变。" };
+}
+
+export async function validatedManifest(options) {
+  if (!options.manifest) throw new Error("run 需要 --manifest、--workspace 和 --output-dir");
+  const { workspace, outputDir, deliveryDir, contract } = await deliveryContext(options);
+  const manifestPath = await existingFieldPath(path.resolve(options.manifest), workspace, "manifest", "file");
+  let manifest;
+  try { manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    invalid("JSON", "manifest", `JSON 解析失败：${error.message}`, "请修正 JSON 语法，不添加 Markdown 围栏或注释；用 template 创建初始格式。");
+  }
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    invalid("ROOT", "manifest", "顶层必须是对象，不能直接使用数组", '结构为 {"version":1,"project":"video-project","rows":[...]}；可用 template 生成。');
+  }
+  if (manifest.version !== 1) invalid("VERSION", "version", "必须填写数字 1", "请保留顶层 version: 1；可用 template 生成标准格式。");
+  if (!Array.isArray(manifest.rows)) {
+    invalid("ROWS", "rows", "缺失或不是数组", "正式行必须放在顶层 rows 数组，不使用 renders/videos；可用 template 生成准确槽位。");
+  }
+  if (manifest.rows.length !== contract.slots.length) {
+    invalid("ROW_COUNT", "rows.length", `要求 ${contract.slots.length} 行，实际 ${manifest.rows.length} 行`, "每个正式槽位对应一行，包括已完成行；不要删掉已完成行。");
+  }
+  if (typeof manifest.project !== "string" || !manifest.project.trim() || path.isAbsolute(manifest.project)) {
+    invalid("PROJECT", "project", "项目路径必须相对任务工作目录", '例如 project: "video-project"，不要填写绝对路径或程序目录。');
+  }
+  const project = await existingFieldPath(path.resolve(workspace, manifest.project), workspace, "project", "directory");
   const settings = manifest.settings ?? {};
-  if (!([24, 30, 60].includes(settings.fps ?? 30)) || !["standard", "high", "draft"].includes(settings.quality ?? "high")) {
-    throw new Error("渲染帧率或画质设置无效");
-  }
-  if (settings.format && settings.format !== "mp4") throw new Error("渲染清单仅支持 MP4");
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) invalid("SETTINGS", "settings", "必须是设置对象");
+  if (![24, 30, 60].includes(settings.fps ?? 30)) invalid("FPS", "settings.fps", "必须是数字 24、30 或 60");
+  if (!["standard", "high", "draft"].includes(settings.quality ?? "high")) invalid("QUALITY", "settings.quality", "必须是 standard、high 或 draft");
+  if (settings.format && settings.format !== "mp4") invalid("FORMAT", "settings.format", "渲染清单仅支持 MP4", '请填写 format: "mp4"。');
   if (settings.crf !== undefined && (!Number.isInteger(settings.crf) || settings.crf < 0 || settings.crf > 51)) {
-    throw new Error("CRF 必须是 0–51 的整数");
+    invalid("CRF", "settings.crf", "CRF 必须是 0–51 的整数");
   }
   const seen = new Set();
   const rows = [];
   for (const [index, row] of manifest.rows.entries()) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) invalid("ROW", `rows[${index}]`, "每行必须是对象");
     if (typeof row.composition !== "string" || path.isAbsolute(row.composition) || !row.composition.endsWith(".html")) {
-      throw new Error(`第 ${index + 1} 行的工程文件无效`);
+      invalid("COMPOSITION", `rows[${index}].composition`, `第 ${index + 1} 行的工程文件无效`, '请填写相对 project 的 HTML 路径，例如 "compositions/01.html"。');
     }
-    const composition = await fs.realpath(path.resolve(project, row.composition));
-    if (!inside(project, composition) || !(await fs.stat(composition)).isFile()) throw new Error(`第 ${index + 1} 行的工程文件越界`);
+    const composition = await existingFieldPath(path.resolve(project, row.composition), project, `rows[${index}].composition`, "file");
     if (row.output !== contract.slots[index]) {
-      throw new Error(`第 ${index + 1} 行输出文件名必须使用本任务预留位置：${contract.slots[index]}`);
+      invalid("OUTPUT", `rows[${index}].output`, `第 ${index + 1} 行输出文件名必须使用本任务预留位置：${contract.slots[index]}`, "请复制 template 中该行的 output，不能自行命名或将试片当作正式成片。");
     }
     const output = path.resolve(outputDir, row.output);
     if (!inside(outputDir, output) || output === outputDir) throw new Error(`第 ${index + 1} 行的输出路径越界`);
@@ -280,7 +353,15 @@ export async function validatedManifest(options) {
     if (existing?.isSymbolicLink()) throw new Error(`第 ${index + 1} 行的输出是符号链接`);
     if (seen.has(output.toLowerCase())) throw new Error("渲染清单有重复输出路径");
     seen.add(output.toLowerCase());
-    const audio = await validateAudio(row, composition, project, contract, settings.fps ?? 30);
+    let audio;
+    try { audio = await validateAudio(row, composition, project, contract, settings.fps ?? 30); }
+    catch (error) {
+      // Process, decoding and temporary I/O errors are not deterministic
+      // manifest errors; do not turn them into a no-progress loop stop.
+      if (/启动失败|退出码/.test(error.message) || (error.code && error.code !== "ENOENT")) throw error;
+      invalid("MAIN_AUDIO", `rows[${index}].mainAudio / composition`, error.message,
+        "请使用音频目录或工作目录中的主音频，核对 source/from/to/at/rate 与工程 <audio> 的相同区间；根 data-duration 按主音频时间线填写。不要改正式 output 槽位。");
+    }
     const rowSignature = createHash("sha256").update(JSON.stringify({
       output: row.output, composition: row.composition, audioTarget: audio.target,
       silent: audio.silent, inputs: audio.inputs,
@@ -477,7 +558,9 @@ function parseArgs(argv) {
   const [command, ...rest] = argv;
   const options = {};
   for (let i = 0; i < rest.length; i += 2) {
-    if (!rest[i]?.startsWith("--") || !rest[i + 1]) throw new Error(`参数不完整：${rest[i]}`);
+    if (!["--manifest", "--workspace", "--output-dir", "--project"].includes(rest[i]) || !rest[i + 1]
+      || Object.hasOwn(options, rest[i].slice(2))) throw new Error(`参数不完整、未知或重复：${rest[i]}`);
+    if (command === "run" && rest[i] === "--project") throw new Error("run 的工程路径在清单 project 字段中填写，不接受 --project");
     options[rest[i].slice(2)] = rest[i + 1];
   }
   return { command, options };
@@ -489,9 +572,16 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     for (const child of children) void killTree(child);
   });
   try {
-    const { command, options } = parseArgs(process.argv.slice(2));
-    if (command !== "run") throw new Error("用法：render-queue.mjs run --manifest <JSON> --workspace <任务工作目录> --output-dir <输出目录>");
-    process.stdout.write(`${JSON.stringify(await runQueue(options))}\n`);
+    const argv = process.argv.slice(2);
+    const usage = "用法：render-queue.mjs template|run --manifest <JSON> --workspace <任务工作目录> --output-dir <输出目录>。template 可加 --project <相对工程目录>，不会覆盖已有清单。";
+    if ((argv.length === 1 && ["--help", "-h"].includes(argv[0]))
+      || (argv.length === 2 && ["template", "run"].includes(argv[0]) && ["--help", "-h"].includes(argv[1]))) {
+      process.stdout.write(`${usage}\n`);
+    } else {
+      const { command, options } = parseArgs(argv);
+      if (!["run", "template"].includes(command)) throw new Error(usage);
+      process.stdout.write(`${JSON.stringify(await (command === "template" ? createManifestTemplate(options) : runQueue(options)))}\n`);
+    }
   } catch (error) {
     process.stderr.write(`render-queue: ${publicError(error.message)}\n`);
     process.exitCode = 1;

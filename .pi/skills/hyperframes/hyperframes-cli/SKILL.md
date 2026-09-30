@@ -13,7 +13,7 @@ description: >
 
 ## Clip Studio 多成片渲染
 
-Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪辑方案、HyperFrames 工程和 composition。准备渲染时，在当前任务工作目录写一份 `render-manifest.json`：
+Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪辑方案、HyperFrames 工程和 composition。准备渲染时，先用任务提示提供的队列入口生成标准清单：`node <渲染队列脚本绝对路径> template --manifest <工作目录/render-manifest.json> --workspace <当前工作目录> --output-dir <用户输出目录>`。模板准确预填 `version`、`rows` 和本任务全部正式文件名；填写工程、composition 和主音频即可。已有清单不会被覆盖，续作时直接读取并保留已完成行。结构示例：
 
 ```json
 {
@@ -38,9 +38,9 @@ Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪�
 
 单段裁剪也可在 `mainAudio` 中直接写 `source`、`from`、`to`、`at` 和 `rate`。
 
-短音效和背景音乐不计入主音频时长。普通任务没有可用主音频时说明原因；明确要求无声且给出秒数时才可在行中使用 `silentDuration`。清单不保存密钥。若工作目录已有有效清单，先读它并保留已完成行；旧清单缺少本任务槽位或主音频时，修复清单再渲染，不直接执行。调用 `node <任务提示提供的渲染队列脚本绝对路径> run --manifest <清单绝对路径> --workspace <当前任务工作目录> --output-dir <用户输出目录>`，等待前台命令结束；任务 Session 的当前目录是工作目录，不能使用相对 `.pi` 路径。CLI 根据本机可用 CPU、内存和渲染进程内存调整并发；正常渲染请求 HyperFrames `--gpu`，仅硬件路径失败时对该条尝试一次软件路径。每条输出通过 FFprobe、主音频时长和交付凭据检查后才记为完成。失败后再次调用同一清单只处理缺失行，已有可验证成片保持不变。不要另起 Pi Session 或安装依赖，也不要通过读取 Session 日志、其他任务或程序实现来猜测调用方式。
+短音效和背景音乐不计入主音频时长。普通任务没有可用主音频时说明原因；明确要求无声且给出秒数时才可在行中使用 `silentDuration`。清单不保存密钥。若清单缺少本任务槽位或主音频，修复后再渲染。调用 `node <任务提示提供的渲染队列脚本绝对路径> run --manifest <清单绝对路径> --workspace <当前任务工作目录> --output-dir <用户输出目录>`，等待前台命令结束；不能使用相对 `.pi` 路径。`[VALIDATION:...]` 指出具体字段和修正方法：只修对应字段，不改成 `renders`、`videos` 或顶层数组。同一确定性错误没有实质修正时最多尝试三次，不能靠重新调用绕过。CLI 根据本机 CPU、可用内存和实际进程内存调整并发；正常渲染请求 `--gpu`，仅硬件路径失败时对该条尝试一次软件路径。输出通过 FFprobe、主音频时长和交付凭据检查后才记完成。同一清单重试只处理缺失行，已验证成片保持不变。不要另起 Session、安装组件或读取程序实现来猜调用方式。
 
-新建当前任务工程时，使用提示给出的本地 HyperFrames 脚本绝对路径，执行 `HYPERFRAMES_SKIP_SKILLS=1 node "<本地脚本>" init video-project --non-interactive --example blank`。初始化生成的技能更新建议不属于视频任务，不执行。
+新建当前任务工程时，使用提示给出的本地 HyperFrames 脚本绝对路径，执行 `HYPERFRAMES_SKIP_SKILLS=1 node "<本地脚本>" init video-project --non-interactive --example blank`，保留生成的根 `index.html`。`lint`/`check` 接收工程目录（例如 `node "<本地脚本>" lint "<工程目录>"`），不是单个 composition 文件，也不使用 `-c`。独立成片在清单中指定 `composition`；HTML 结构和 GSAP 引入方式直接读取本地 `hyperframes-core/references/minimal-composition.md`，命令参数查 `<命令> --help`。初始化生成的技能更新建议不属于视频任务，不执行。
 
 Run commands as `npx hyperframes ...` unless project instructions provide a wrapper. Obey the wrapper when present. The CLI requires Node.js 22 or newer and FFmpeg.
 

@@ -44,6 +44,8 @@ export interface CreateTaskInput {
   outputDir: string;
   taskRequest: string;
   generateCount: number;
+  /** Cross-task visual observations; new tasks default to false. */
+  reuseVisualAnalysis?: boolean;
   model: ModelConfig;
   modelCapabilityId: string;
 }
@@ -76,6 +78,8 @@ export interface Task {
     outputDir: string;
     taskRequest: string;
     generateCount: number;
+    /** Absent only in legacy tasks, which keep their original reuse behavior. */
+    reuseVisualAnalysis?: boolean;
   };
   model: {
     provider: string;

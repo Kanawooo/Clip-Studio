@@ -50,6 +50,9 @@ export function parseCreateTaskInput(body: unknown): CreateTaskInput {
   if (!Number.isInteger(generateCount) || Number(generateCount) < 1 || Number(generateCount) > 20) {
     throw new HttpError(400, "generateCount must be an integer between 1 and 20");
   }
+  if (raw.reuseVisualAnalysis !== undefined && typeof raw.reuseVisualAnalysis !== "boolean") {
+    throw new HttpError(400, "reuseVisualAnalysis must be a boolean when provided");
+  }
   validateTaskPaths({ referenceVideo, assetsDir, audioDir, outputDir });
   return {
     referenceVideo,
@@ -57,6 +60,7 @@ export function parseCreateTaskInput(body: unknown): CreateTaskInput {
     audioDir,
     outputDir,
     generateCount: Number(generateCount),
+    reuseVisualAnalysis: raw.reuseVisualAnalysis === true,
     taskRequest: taskRequestString(raw.taskRequest),
     model: parseModelConfig(raw.model),
     modelCapabilityId: requiredString(raw.modelCapabilityId, "modelCapabilityId"),

@@ -1,6 +1,7 @@
-import { existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
-import type { InlineExtension, ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import type { InlineExtension, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import {
   effectivePath, pathInside, resolveTaskPaths, sameFilePath,
   type TaskPathOptions, type TaskPaths,
@@ -15,6 +16,7 @@ interface Boundary extends TaskPaths {
   renderQueueScript: string;
   hyperframesScript: string;
   audioDataScript: string;
+  mediaPolicy: string;
 }
 
 interface Token { kind: "word" | "operator"; value: string }
@@ -22,8 +24,9 @@ interface Segment { words: string[]; redirects: Array<{ operator: string; target
 
 const READ_BLOCK = "该路径不属于当前任务可读范围。请读取本任务工作目录、四个已选路径或项目本地技能文档；缓存图片由素材索引复制到工作目录。";
 const WRITE_BLOCK = "写入目标不在当前任务工作目录。请将工程和中间文件写入任务工作目录；最终成片由渲染队列写入指定输出目录。";
-const COMMAND_BLOCK = "无法确认该命令的访问范围。请使用 Pi 原生文件工具，或直接调用已安装的 FFmpeg/FFprobe、素材索引及 HyperFrames CLI；脚本必须使用已核对的本地绝对入口。";
+const COMMAND_BLOCK = "无法确认该命令的访问范围。请使用 Pi 原生文件工具，或直接调用已安装的 FFmpeg/FFprobe、素材索引及 HyperFrames CLI；脚本使用本地绝对入口。批量操作使用单行 && 和明确文件名，不使用通配符、换行续写或内联脚本。";
 const SETUP_BLOCK = "视频任务不安装、更新、认证或发布。请使用已安装的剪辑组件；缺失时报告实际错误。";
+const POLICY_WRITE_BLOCK = "media-policy.json 是任务创建时固定的配置，只能读取。请将分析、工程和中间文件写入其他工作区文件。";
 const HYPERFRAMES_COMMANDS = new Set(["lint", "check", "beats", "transcribe", "keyframes", "compositions", "info", "catalog"]);
 const READ_COMMANDS = new Set(["ls", "dir", "rg", "grep", "find", "cat", "type", "head", "tail", "stat", "wc", "pwd"]);
 const MUTATION_COMMANDS = new Set(["mkdir", "md", "touch", "rm", "del", "erase", "rmdir", "rd", "cp", "copy", "mv", "move"]);
@@ -35,7 +38,18 @@ const ALIAS_GROUPS = [["--project", "--dir", "-d"], ["--output", "--out", "-o"],
 
 export function createTaskAccessPolicy(options: TaskAccessPolicyOptions): InlineExtension {
   const handler = createTaskAccessHandler(options);
-  return { name: "task-access-policy", hidden: true, factory: (pi) => { pi.on("tool_call", handler); } };
+  const failure = createRenderFailureHandler(options);
+  return { name: "task-access-policy", hidden: true, factory: (pi) => {
+    pi.on("tool_call", (event) => {
+      const result = handler(event);
+      if (!result) failure.before(event);
+      return result;
+    });
+    pi.on("tool_result", (event, context) => {
+      const reason = failure.after(event);
+      if (reason) { options.onTermination?.(reason); context.abort(); }
+    });
+  } };
 }
 
 /** Stateful handler exported for deterministic, command-free policy tests. */
@@ -47,11 +61,15 @@ export function createTaskAccessHandler(options: TaskAccessPolicyOptions): (even
     renderQueueScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
     hyperframesScript: effectivePath(path.join(paths.projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs")),
     audioDataScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-creative", "scripts", "extract-audio-data.py")),
+    mediaPolicy: path.join(paths.workspace, "media-policy.json"),
   };
   let repeated: { key: string; count: number } | undefined;
   return (event) => {
-    const reason = violation(event, boundary);
+    let reason = violation(event, boundary);
     if (!reason) { repeated = undefined; return undefined; }
+    if (reason === READ_BLOCK) {
+      reason += ` 技能文档根目录：${boundary.skillRoots.map((root) => root.replace(/\\/g, "/")).join("、")}。请直接在这些目录查找文档，不搜索程序根目录或 node_modules。`;
+    }
     const key = `${event.toolName}\n${reason}\n${JSON.stringify(event.input)}`;
     repeated = repeated?.key === key ? { key, count: repeated.count + 1 } : { key, count: 1 };
     const terminate = repeated.count >= 3;
@@ -69,6 +87,7 @@ function violation(event: ToolCallEvent, boundary: Boundary): string | undefined
   if (event.toolName === "bash") return bashViolation(typeof input.command === "string" ? input.command : "", boundary);
   const candidate = toolPath(input);
   if (event.toolName === "write" || event.toolName === "edit") {
+    if (candidate && protectedPolicyPath(candidate, boundary.workspace, boundary)) return POLICY_WRITE_BLOCK;
     return candidate && writable(candidate, boundary.workspace, boundary) ? undefined : WRITE_BLOCK;
   }
   if (["read", "grep", "find", "ls"].includes(event.toolName)) {
@@ -99,8 +118,19 @@ function writable(value: string, cwd: string, boundary: Boundary): boolean {
   if (dynamic(value) || protocol(value)) return false;
   try {
     const resolved = path.resolve(cwd, value);
-    return pathInside(boundary.workspace, resolved) && pathInside(boundary.workspace, effectivePath(resolved));
+    return !protectedPolicyPath(value, cwd, boundary)
+      && pathInside(boundary.workspace, resolved) && pathInside(boundary.workspace, effectivePath(resolved));
   } catch { return false; }
+}
+
+function protectedPolicyPath(value: string, cwd: string, boundary: Boundary): boolean {
+  try {
+    const candidate = effectivePath(path.resolve(cwd, value));
+    if (sameFilePath(candidate, boundary.mediaPolicy)) return true;
+    if (!existsSync(candidate) || !existsSync(boundary.mediaPolicy)) return false;
+    const actual = statSync(candidate), policy = statSync(boundary.mediaPolicy);
+    return actual.isFile() && actual.ino !== 0 && actual.dev === policy.dev && actual.ino === policy.ino;
+  } catch { return true; }
 }
 
 function bashViolation(command: string, boundary: Boundary): string | undefined {
@@ -109,17 +139,28 @@ function bashViolation(command: string, boundary: Boundary): string | undefined 
   const tokens = tokenize(command);
   if (!tokens) return COMMAND_BLOCK;
   let cwd = boundary.workspace;
-  let remaining = tokens;
-  const firstAnd = tokens.findIndex((item) => item.kind === "operator" && item.value === "&&");
-  if (firstAnd >= 0) {
-    const cd = parseSegment(tokens.slice(0, firstAnd));
-    if (!cd || cd.redirects.length || cd.words.length !== 2 || cd.words[0]?.toLowerCase() !== "cd") return COMMAND_BLOCK;
-    const target = path.resolve(cwd, cd.words[1]!);
-    if (!readable(target, cwd, boundary) || !existsSync(target) || !statSync(target).isDirectory()) return READ_BLOCK;
-    cwd = effectivePath(target);
-    remaining = tokens.slice(firstAnd + 1);
+  if (tokens.some((item) => item.kind === "operator" && [";", "||", "&", "<<", "&>"].includes(item.value))) return COMMAND_BLOCK;
+  const clauses: Token[][] = [[]];
+  for (const token of tokens) {
+    if (token.kind === "operator" && token.value === "&&") clauses.push([]);
+    else clauses.at(-1)!.push(token);
   }
-  if (remaining.some((item) => item.kind === "operator" && [";", "&&", "||", "&", "<<", "&>"].includes(item.value))) return COMMAND_BLOCK;
+  for (const clause of clauses) {
+    const segment = parseSegment(clause);
+    if (segment?.words[0]?.toLowerCase() === "cd") {
+      if (segment.redirects.length || segment.words.length !== 2) return COMMAND_BLOCK;
+      const target = path.resolve(cwd, segment.words[1]!);
+      if (!readable(target, cwd, boundary) || !existsSync(target) || !statSync(target).isDirectory()) return READ_BLOCK;
+      cwd = effectivePath(target);
+      continue;
+    }
+    const reason = inspectPipeline(clause, cwd, boundary);
+    if (reason) return reason;
+  }
+  return undefined;
+}
+
+function inspectPipeline(remaining: Token[], cwd: string, boundary: Boundary): string | undefined {
   const pipe = remaining.findIndex((item) => item.kind === "operator" && item.value === "|");
   const left = parseSegment(pipe < 0 ? remaining : remaining.slice(0, pipe));
   if (!left || !left.words.length) return COMMAND_BLOCK;
@@ -158,7 +199,9 @@ function inspectSegment(segment: Segment, cwd: string, boundary: Boundary): stri
   }
   if (ALIAS_GROUPS.some((group) => group.filter((flag) => seenFlags.has(flag)).length > 1)) return COMMAND_BLOCK;
   const name = executable(program);
-  if (!pathInside(boundary.workspace, cwd) && !READ_COMMANDS.has(name) && name !== "ffprobe") {
+  const publicHelp = ["node", "hyperframes", "npx"].includes(name)
+    && (helpOnly(args) || helpOnly(args.slice(1)) || (name === "node" && helpOnly(args.slice(2))));
+  if (!pathInside(boundary.workspace, cwd) && !READ_COMMANDS.has(name) && name !== "ffprobe" && !publicHelp) {
     return "当前目录是只读媒体目录。请切回任务工作目录运行 FFmpeg 或本地技能 CLI，并传入媒体绝对路径。";
   }
   if (path.isAbsolute(program) && !["ffmpeg", "ffprobe", "node", "python", "python3", "py", "hyperframes"]
@@ -240,8 +283,8 @@ function inspectNode(args: string[], cwd: string, boundary: Boundary, skipSkillC
   if (!script || !path.isAbsolute(script) || !action) return COMMAND_BLOCK;
   const actual = effectivePath(script);
   if (skipSkillChecks && !sameFilePath(actual, boundary.hyperframesScript)) return COMMAND_BLOCK;
-  if (sameFilePath(actual, boundary.mediaCacheScript)) return inspectMediaCache(action, rest, cwd, boundary);
-  if (sameFilePath(actual, boundary.renderQueueScript)) return inspectRenderQueue(action, rest, cwd, boundary);
+  if (sameFilePath(actual, boundary.mediaCacheScript)) return helpOnly([action, ...rest]) ? undefined : inspectMediaCache(action, rest, cwd, boundary);
+  if (sameFilePath(actual, boundary.renderQueueScript)) return helpOnly([action, ...rest]) ? undefined : inspectRenderQueue(action, rest, cwd, boundary);
   if (sameFilePath(actual, boundary.hyperframesScript)) return inspectHyperframes([action, ...rest], cwd, boundary, skipSkillChecks);
   return COMMAND_BLOCK;
 }
@@ -255,7 +298,28 @@ function inspectPython(args: string[], cwd: string, boundary: Boundary): string 
 }
 
 function inspectMediaCache(action: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
-  if (!["index", "annotate", "detail", "window", "resheet", "check-plan"].includes(action)) return COMMAND_BLOCK;
+  if (!["index", "overview", "entry", "annotate", "annotate-batch", "transcribe-batch", "detail", "window", "resheet", "check-plan"].includes(action)) return COMMAND_BLOCK;
+  if (helpOnly(args)) return undefined;
+  if (["overview", "entry", "annotate-batch", "transcribe-batch"].includes(action)) {
+    const allowed = action === "overview" ? ["--workspace", "--offset", "--limit"]
+      : action === "entry" ? ["--workspace", "--file", "--kind"]
+        : action === "transcribe-batch" ? ["--workspace", "--manifest", "--language", "--model"]
+          : ["--workspace", "--manifest"];
+    if (!validValueFlags(args, allowed)) return COMMAND_BLOCK;
+    const workspace = flagValue(args, "--workspace");
+    if (!workspace || !sameFilePath(effectivePath(path.resolve(cwd, workspace)), boundary.workspace)) return WRITE_BLOCK;
+    if (action === "overview") {
+      const offset = flagValue(args, "--offset"), limit = flagValue(args, "--limit");
+      return (offset !== undefined && !/^\d+$/.test(offset))
+        || (limit !== undefined && (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 100)) ? COMMAND_BLOCK : undefined;
+    }
+    if (action === "entry") {
+      const file = flagValue(args, "--file"), kind = flagValue(args, "--kind");
+      return file && readable(file, cwd, boundary) && ["reference", "source", "audio"].includes(kind ?? "") ? undefined : READ_BLOCK;
+    }
+    const manifest = flagValue(args, "--manifest");
+    return manifest && pathInside(boundary.workspace, effectivePath(path.resolve(cwd, manifest))) ? undefined : READ_BLOCK;
+  }
   if (action === "index") {
     for (const [flag, expected] of [["--reference", boundary.referenceVideo], ["--assets", boundary.assetsDir],
       ["--audio", boundary.audioDir], ["--workspace", boundary.workspace]] as const) {
@@ -279,7 +343,10 @@ function inspectMediaCache(action: string, args: string[], cwd: string, boundary
 }
 
 function inspectRenderQueue(action: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
-  if (action !== "run") return `渲染队列只支持 run：${renderCommand(boundary)}`;
+  if (!["run", "template"].includes(action)) return `渲染队列支持 template 生成标准清单和 run 渲染：${renderCommand(boundary)}`;
+  if (helpOnly(args)) return undefined;
+  if (!validValueFlags(args, action === "template"
+    ? ["--workspace", "--output-dir", "--manifest", "--project"] : ["--workspace", "--output-dir", "--manifest"])) return COMMAND_BLOCK;
   const flags = [["--workspace", boundary.workspace], ["--output-dir", boundary.outputDir]] as const;
   for (const [flag, expected] of flags) {
     const value = flagValue(args, flag);
@@ -287,12 +354,17 @@ function inspectRenderQueue(action: string, args: string[], cwd: string, boundar
   }
   const manifest = flagValue(args, "--manifest");
   if (!manifest || !writable(manifest, cwd, boundary)) return `渲染清单必须位于当前任务工作目录：${renderCommand(boundary)}`;
+  const project = flagValue(args, "--project");
+  if (project && (path.isAbsolute(project) || !writable(project, boundary.workspace, boundary))) return WRITE_BLOCK;
   return undefined;
 }
 
 function inspectHyperframes(args: string[], cwd: string, boundary: Boundary, offlineInit = false): string | undefined {
   if (!existsSync(boundary.hyperframesScript)) return "本地 HyperFrames CLI 未安装，请报告组件缺失错误。";
   const [action, ...rest] = args;
+  // Public help does not read media or create a project. Never treat --help
+  // with additional positional/path arguments as this read-only form.
+  if (helpOnly(args) || (action && (HYPERFRAMES_COMMANDS.has(action) || ["init", "render"].includes(action)) && helpOnly(rest))) return undefined;
   if (action === "init") {
     const command = `HYPERFRAMES_SKIP_SKILLS=1 node "${boundary.hyperframesScript.replace(/\\/g, "/")}" init video-project --non-interactive --example blank`;
     if (!offlineInit) return `本地离线初始化请使用：${command}。不要执行技能更新。`;
@@ -310,6 +382,11 @@ function inspectHyperframes(args: string[], cwd: string, boundary: Boundary, off
       || (resolution && !["landscape", "portrait", "square", "landscape-4k", "portrait-4k", "square-4k"].includes(resolution))
       || !pathInside(boundary.workspace, cwd)) return `初始化参数不符合当前任务本地模板要求：${command}`;
     return undefined;
+  }
+  if (action === "render") return `正式渲染请使用任务渲染队列，它会保留完成记录并校验主音频：${renderCommand(boundary)}`;
+  if (action === "docs") {
+    const reference = path.join(boundary.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-core", "references", "minimal-composition.md").replace(/\\/g, "/");
+    return `当前任务通过本地技能文档读取工程示例：${reference}。命令参数使用本地 CLI 的 <命令> --help 查询，不查程序实现。`;
   }
   if (!action || !HYPERFRAMES_COMMANDS.has(action)) return SETUP_BLOCK;
   const project = flagValue(rest, "--project") ?? flagValue(rest, "--dir") ?? flagValue(rest, "-d");
@@ -336,17 +413,120 @@ function inspectHyperframes(args: string[], cwd: string, boundary: Boundary, off
 }
 
 function inspectMutation(name: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
+  if (args.some((arg) => arg.startsWith("--") && !["--recursive", "--force", "--parents", "--preserve", "--verbose"].includes(arg)
+    || arg.startsWith("-") && !/^-([rRfpiv]+)$/.test(arg))) return COMMAND_BLOCK;
   const paths = args.filter((arg) => !arg.startsWith("-"));
   if (!paths.length) return COMMAND_BLOCK;
   if (["cp", "copy", "mv", "move"].includes(name)) {
     if (paths.length !== 2) return COMMAND_BLOCK;
     if (!(name === "cp" || name === "copy" ? readable(paths[0]!, cwd, boundary) : writable(paths[0]!, cwd, boundary))) return READ_BLOCK;
-    return writable(paths[1]!, cwd, boundary) ? undefined : WRITE_BLOCK;
+    let destination = path.resolve(cwd, paths[1]!);
+    const source = path.resolve(cwd, paths[0]!);
+    if (existsSync(source) && statSync(source).isDirectory() && pathInside(destination, boundary.mediaPolicy)) return POLICY_WRITE_BLOCK;
+    if (existsSync(destination) && statSync(destination).isDirectory()) destination = path.join(destination, path.basename(paths[0]!));
+    return writable(destination, cwd, boundary) ? undefined : WRITE_BLOCK;
   }
   for (const target of paths) {
     if (!writable(target, cwd, boundary) || sameFilePath(effectivePath(path.resolve(cwd, target)), boundary.workspace)) return WRITE_BLOCK;
   }
   return undefined;
+}
+
+/** Counts only explicitly marked, deterministic render validation failures.
+ * State is session-local: a user retry gets a fresh guard, while a read/help
+ * between unchanged failing runs is not mistaken for file progress. */
+export function createRenderFailureHandler(options: TaskAccessPolicyOptions) {
+  const queue = effectivePath(path.join(options.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs"));
+  const workspace = effectivePath(options.workspace);
+  const pending = new Map<string, { fingerprint: string; fields: Record<string, string> }>();
+  const failures = new Map<string, { fingerprint: string; count: number }>();
+  function before(event: ToolCallEvent): void {
+    if (event.toolName !== "bash" || typeof event.input.command !== "string") return;
+    const tokens = tokenize(event.input.command);
+    if (!tokens) return;
+    let cwd = workspace;
+    const clauses: Token[][] = [[]];
+    for (const token of tokens) {
+      if (token.kind === "operator" && token.value === "&&") clauses.push([]);
+      else clauses.at(-1)!.push(token);
+    }
+    for (const clause of clauses) {
+      const words = parseSegment(clause)?.words;
+      if (!words?.length) continue;
+      if (words[0] === "cd" && words.length === 2) cwd = path.resolve(cwd, words[1]!);
+      const nodeArgs = words[0] === "HYPERFRAMES_SKIP_SKILLS=1" ? words.slice(1) : words;
+      if (executable(nodeArgs[0] ?? "") === "node" && nodeArgs[1] && path.isAbsolute(nodeArgs[1])
+        && sameFilePath(nodeArgs[1], queue) && nodeArgs[2] === "run") {
+        const manifest = flagValue(nodeArgs.slice(3), "--manifest");
+        if (manifest) {
+          const manifestPath = path.resolve(cwd, manifest);
+          const fields: Record<string, string> = {};
+          try {
+            const parsed = JSON.parse(readFileSync(manifestPath, "utf8"));
+            fields.ROOT = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? "object" : typeof parsed;
+            fields.VERSION = JSON.stringify(parsed?.version) ?? "missing";
+            fields.ROWS = Array.isArray(parsed?.rows) ? "array" : parsed?.rows == null ? "missing" : typeof parsed.rows;
+            fields.ROW_COUNT = String(Array.isArray(parsed?.rows) ? parsed.rows.length : "missing");
+          } catch { /* invalid JSON uses the complete byte fingerprint */ }
+          pending.set(event.toolCallId, { fingerprint: renderFingerprint(manifestPath, workspace, options.audioDir), fields });
+        }
+      }
+    }
+  }
+  function after(event: ToolResultEvent): string | undefined {
+    const snapshot = pending.get(event.toolCallId);
+    pending.delete(event.toolCallId);
+    if (!snapshot) return undefined;
+    if (!event.isError) { failures.clear(); return undefined; }
+    const text = event.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+    const message = text.match(/render-queue:\s*(\[VALIDATION:[A-Z_]+\][^\r\n]*)/)?.[1];
+    if (!message) return undefined;
+    const code = message.match(/^\[VALIDATION:([A-Z_]+)\]/)?.[1] ?? "";
+    // Adding renders/videos or changing an unrelated field is not progress
+    // toward fixing a missing version/rows contract.
+    const fingerprint = snapshot.fields[code] ?? snapshot.fingerprint;
+    const previous = failures.get(message);
+    const count = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
+    failures.set(message, { fingerprint, count });
+    if (count < 3) return undefined;
+    return `制作失败：${message} 同一错误的相关输入未变化，已重复失败 3 次，已停止重复调用。请按字段原因修正后在原任务重试；已验证成片保持不变。`;
+  }
+  return { before, after };
+}
+
+function renderFingerprint(manifestPath: string, workspace: string, audioDir: string): string {
+  const hash = createHash("sha256");
+  function record(file: string, content = false): void {
+    hash.update(file);
+    try {
+      const stat = statSync(file);
+      hash.update(JSON.stringify([stat.size, stat.mtimeMs]));
+      if (content && stat.isFile() && stat.size <= 5 * 1024 * 1024) hash.update(readFileSync(file));
+    } catch (error) { hash.update((error as NodeJS.ErrnoException).code ?? "unavailable"); }
+  }
+  record(manifestPath, true);
+  record(path.join(workspace, "..", "delivery", "contract.json"), true);
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const project = typeof manifest.project === "string" ? path.resolve(workspace, manifest.project) : workspace;
+    if (!pathInside(workspace, project)) return hash.digest("hex");
+    record(project);
+    for (const row of Array.isArray(manifest.rows) ? manifest.rows : []) {
+      if (!row || typeof row !== "object") continue;
+      if (typeof row.composition === "string") {
+        const file = path.resolve(project, row.composition);
+        if (pathInside(workspace, file)) record(file, true);
+      }
+      const segments = row.mainAudio?.segments ?? (row.mainAudio?.source ? [row.mainAudio] : []);
+      for (const segment of Array.isArray(segments) ? segments : []) {
+        if (typeof segment?.source === "string") {
+          const file = path.resolve(project, segment.source);
+          if (pathInside(workspace, file) || pathInside(audioDir, file)) record(file);
+        }
+      }
+    }
+  } catch { /* malformed manifests are already represented by their bytes */ }
+  return hash.digest("hex");
 }
 
 function parseSegment(tokens: Token[]): Segment | undefined {
@@ -376,6 +556,9 @@ function tokenize(command: string): Token[] | undefined {
       continue;
     }
     if (char === "'" || char === '"') { quote = char; continue; }
+    // Do not validate a literal path and then let Bash expand it to a
+    // different set of files (including the backend-owned task policy).
+    if (/[\*?\[\]{}~]/.test(char)) return undefined;
     if (/\s/.test(char)) { flush(); if (char === "\n" || char === "\r") tokens.push({ kind: "operator", value: ";" }); continue; }
     if (char === "&" || char === ";" || char === "|") {
       flush();
@@ -424,6 +607,20 @@ function flagValue(args: string[], flag: string): string | undefined {
   if (index >= 0) return args[index + 1];
   const prefix = `${flag}=`;
   return args.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
+}
+
+function helpOnly(args: string[]): boolean { return args.length === 1 && ["--help", "-h"].includes(args[0]!); }
+
+function validValueFlags(args: string[], allowed: string[]): boolean {
+  const seen = new Set<string>();
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!, separator = arg.indexOf("=");
+    const flag = separator < 0 ? arg : arg.slice(0, separator);
+    const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
+    if (!allowed.includes(flag) || seen.has(flag) || !value || value.startsWith("--")) return false;
+    seen.add(flag);
+  }
+  return true;
 }
 
 function positionalArgs(args: string[], valueFlags: Set<string>): string[] {

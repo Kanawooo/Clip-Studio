@@ -46,7 +46,7 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
   let policyFailure: string | undefined;
   const resourceLoader = await createProjectResourceLoader({
     ...options,
-    onPolicyTermination: (reason) => { policyFailure = `访问策略：${reason}`; },
+    onPolicyTermination: (reason) => { policyFailure = reason.startsWith("制作失败：") ? reason : `访问策略：${reason}`; },
   });
   const { skills } = resourceLoader.getSkills();
   const skillNames = new Set(skills.map((skill) => skill.name));

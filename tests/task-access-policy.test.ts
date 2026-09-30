@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { createTaskAccessHandler } from "../src/pi/access-policy.js";
+import { createRenderFailureHandler, createTaskAccessHandler } from "../src/pi/access-policy.js";
 import { pathInside, resolveTaskPaths, sameFilePath } from "../src/pi/task-paths.js";
 import { TaskManager } from "../src/tasks/manager.js";
 import { materializeTaskView } from "../.pi/skills/clip-skills/scripts/media-cache.mjs";
@@ -131,6 +131,138 @@ test("read-only probes and bounded diagnostic pipes remain available", () => {
   assert.equal(bash(`ffmpeg -i ${q(referenceVideo)} -af silencedetect=noise=-30dB:d=0.5 -f null - 2>&1 | grep silence`), undefined);
   assert.equal(bash(`ffmpeg -i ${q(referenceVideo)} ${q(path.join(workspace, "audio.wav"))}`), undefined);
   assert.equal(bash(`ffmpeg -i ${q(referenceVideo)} ${q(path.join(outputDir, "wrong.mp4"))}`)?.block, true);
+});
+
+test("each clause in a legal batch chain is validated with its own cwd", () => {
+  const probe = `ffprobe -v error -show_format ${q(referenceVideo)}`;
+  assert.equal(bash(`${probe} && ffprobe -v error ${q(path.join(assetsDir, "素材.mp4"))} && ffprobe -v error ${q(path.join(audioDir, "配乐.mp3"))}`), undefined);
+  assert.equal(bash(`cd ${q(assetsDir)} && ls && ffprobe -v error ${q(referenceVideo)} && cd ${q(workspace)} && mkdir parts`), undefined);
+  assert.equal(bash(`${probe} && cat ${q(source)}`)?.block, true);
+  assert.equal(bash(`cd ${q(assetsDir)} && ffmpeg -i ${q(referenceVideo)} ${q(path.join(workspace, "test.mp4"))}`)?.block, true);
+  assert.equal(bash(`cd ${q(workspace)} && ${probe} && node -e "process.exit(0)"`)?.block, true);
+  assert.equal(bash(`${probe} &&`)?.block, true);
+  assert.equal(bash(`${probe} || cat ${q(source)}`)?.block, true);
+  assert.equal(bash(`${probe}; cat ${q(source)}`)?.block, true);
+  assert.equal(bash(`rm -rf ${workspace.replace(/\\/g, "/")}/*`)?.block, true);
+});
+
+test("read-only CLI help does not require a media input or project", () => {
+  for (const command of [`npx hyperframes --help`, `npx hyperframes transcribe --help`,
+    `node ${q(hyperframes)} transcribe -h`, `node ${q(hyperframes)} render --help`,
+    `node ${q(mediaScript)} --help`, `node ${q(mediaScript)} index --help`,
+    `node ${q(queueScript)} run --help`, `node ${q(queueScript)} template --help`,
+    `node ${q(queueScript)} --help`]) assert.equal(bash(command), undefined, command);
+  assert.equal(bash(`cd ${q(audioDir)} && node ${q(hyperframes)} transcribe --help`), undefined);
+  assert.equal(bash(`node ${q(hyperframes)} transcribe --help ${q(outside)}`)?.block, true);
+  assert.equal(bash(`node ${q(mediaScript)} --help ${q(outside)}`)?.block, true);
+  assert.equal(bash(`node ${q(hyperframes)} auth login`)?.block, true);
+});
+
+test("denials identify an admitted alternative without broadening the boundary", () => {
+  const docs = bash(`node ${q(hyperframes)} docs examples`);
+  assert.equal(docs?.block, true);
+  assert.match(docs?.reason ?? "", /hyperframes-core\/references\/minimal-composition\.md/);
+  assert.doesNotMatch(docs?.reason ?? "", /不安装、更新/);
+  const render = bash(`node ${q(hyperframes)} render video-project`);
+  assert.equal(render?.block, true);
+  assert.match(render?.reason ?? "", /渲染队列/);
+  const search = call("find", { path: projectRoot, pattern: "*gsap*" });
+  assert.equal(search?.block, true);
+  assert.match(search?.reason ?? "", /技能文档根目录/);
+  assert.ok(search?.reason?.includes(resolveTaskPaths(options).skillRoots[0]!.replace(/\\/g, "/")));
+  const dynamicCopy = bash(`cp ${assetsDir.replace(/\\/g, "/")}/*.mp4 parts`);
+  assert.equal(dynamicCopy?.block, true);
+  assert.match(dynamicCopy?.reason ?? "", /单行 && 和明确文件名/);
+});
+
+test("template and compact media batch CLI forms remain confined to this task", () => {
+  const manifest = path.join(workspace, "batch-input.json");
+  const base = `--workspace ${q(workspace)}`;
+  assert.equal(bash(`node ${q(queueScript)} template --manifest ${q(manifest)} ${base} --output-dir ${q(outputDir)} --project video-project`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} overview ${base}`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} overview ${base} --offset 25 --limit 25`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} overview ${base} --limit 200`)?.block, true);
+  assert.equal(bash(`node ${q(mediaScript)} entry --file ${q(referenceVideo)} --kind reference ${base}`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} annotate-batch --manifest ${q(manifest)} ${base}`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} transcribe-batch --manifest ${q(manifest)} ${base} --model small.en --language auto`), undefined);
+  assert.equal(bash(`node ${q(mediaScript)} annotate-batch --manifest ${q(outside)} ${base}`)?.block, true);
+  assert.equal(bash(`node ${q(mediaScript)} transcribe-batch --manifest ${q(manifest)} ${base} --output ${q(outside)}`)?.block, true);
+  assert.equal(bash(`node ${q(queueScript)} template --manifest ${q(manifest)} ${base} --output-dir ${q(outputDir)} --project ../escape`)?.block, true);
+});
+
+test("backend-owned media preference remains readable but immutable through all admitted writes", (t) => {
+  const policy = path.join(workspace, "media-policy.json");
+  writeFileSync(policy, '{"version":1,"taskId":"task-one","reuseVisualAnalysis":false}');
+  assert.equal(call("read", { path: policy }), undefined);
+  for (const tool of ["write", "edit"]) assert.equal(call(tool, { path: policy })?.block, true);
+  for (const command of [`rm ${q(policy)}`, `mv ${q(policy)} ${q(path.join(workspace, "removed.json"))}`,
+    `cp ${q(path.join(otherTask, "media-policy.json"))} ${q(policy)}`,
+    `ffprobe -v error -show_format ${q(referenceVideo)} > ${q(policy)}`,
+    `ffmpeg -i ${q(referenceVideo)} ${q(policy)}`,
+    `node ${q(queueScript)} template --manifest ${q(policy)} --workspace ${q(workspace)} --output-dir ${q(outputDir)}`,
+    `rm -rf ${q(workspace)}`, `cp -r ${q(assetsDir)} ${q(workspace)}`]) {
+    assert.equal(bash(command)?.block, true, command);
+  }
+  const alias = path.join(workspace, "policy-alias.json");
+  try { linkSync(policy, alias); } catch { t.skip("file hardlinks unavailable"); return; }
+  assert.equal(call("write", { path: alias })?.block, true);
+  assert.equal(bash(`ffprobe -v error -show_format ${q(referenceVideo)} > ${q(alias)}`)?.block, true);
+  assert.equal(readFileSync(policy, "utf8").includes('"reuseVisualAnalysis":false'), true);
+  assert.equal(call("write", { path: path.join(workspace, "normal-observations.json") }), undefined);
+});
+
+test("deterministic validation guard ignores superficial schema guesses and resets on meaningful progress", () => {
+  const manifest = path.join(workspace, "guard-manifest.json");
+  const guard = createRenderFailureHandler(options);
+  const command = `cd ${q(workspace)} && node ${q(queueScript)} run --manifest ${q(manifest)} --workspace ${q(workspace)} --output-dir ${q(outputDir)} 2>&1`;
+  let id = 0;
+  const run = (message: string | null) => {
+    const toolCallId = `guard-${id++}`;
+    guard.before({ toolName: "bash", toolCallId, input: { command } } as Parameters<typeof guard.before>[0]);
+    return guard.after({ toolName: "bash", toolCallId, input: { command }, isError: message !== null,
+      content: [{ type: "text", text: message ? `render-queue: ${message}\nCommand exited with code 1` : "completed" }] } as Parameters<typeof guard.after>[0]);
+  };
+  const missing = "[VALIDATION:ROWS] rows：缺失或不是数组。正式行必须放在顶层 rows 数组。";
+  for (const guessed of [{ version: 1, renders: [] }, { version: 1, videos: [] }]) {
+    writeFileSync(manifest, JSON.stringify(guessed));
+    assert.equal(run(missing), undefined);
+    guard.after({ toolName: "read", toolCallId: "unrelated-read", input: { path: skillDoc }, isError: false,
+      content: [{ type: "text", text: "schema" }] } as Parameters<typeof guard.after>[0]);
+  }
+  writeFileSync(manifest, JSON.stringify({ version: 1, changed: "not rows" }));
+  assert.match(run(missing) ?? "", /rows.*重复失败 3 次/);
+  writeFileSync(manifest, JSON.stringify({ version: 1, rows: [] }));
+  assert.equal(run("[VALIDATION:ROW_COUNT] rows.length：要求 1 行，实际 0 行。"), undefined);
+  assert.equal(run(null), undefined);
+  writeFileSync(manifest, JSON.stringify({ version: 1 }));
+  assert.equal(run(missing), undefined, "a successful queue operation clears the guard");
+  const retry = createRenderFailureHandler(options);
+  retry.before({ toolName: "bash", toolCallId: "retry", input: { command } } as Parameters<typeof retry.before>[0]);
+  assert.equal(retry.after({ toolName: "bash", toolCallId: "retry", input: { command }, isError: true,
+    content: [{ type: "text", text: `render-queue: ${missing}` }] } as Parameters<typeof retry.after>[0]), undefined);
+});
+
+test("validation guard allows modified composition dependencies and does not count transient failures", () => {
+  const project = path.join(workspace, "guard-project");
+  mkdirSync(project, { recursive: true });
+  const composition = path.join(project, "01.html");
+  const manifest = path.join(workspace, "dependency-manifest.json");
+  writeFileSync(manifest, JSON.stringify({ version: 1, project: "guard-project", rows: [{ composition: "01.html" }] }));
+  const guard = createRenderFailureHandler(options);
+  const command = `node ${q(queueScript)} run --manifest ${q(manifest)} --workspace ${q(workspace)} --output-dir ${q(outputDir)}`;
+  for (let index = 0; index < 4; index += 1) {
+    writeFileSync(composition, `<div data-duration="${index + 1}"></div>`);
+    const toolCallId = `dependency-${index}`;
+    guard.before({ toolName: "bash", toolCallId, input: { command } } as Parameters<typeof guard.before>[0]);
+    assert.equal(guard.after({ toolName: "bash", toolCallId, input: { command }, isError: true,
+      content: [{ type: "text", text: "render-queue: [VALIDATION:MAIN_AUDIO] rows[0].mainAudio / composition：工程时长与主音频不符。" }] } as Parameters<typeof guard.after>[0]), undefined);
+  }
+  for (let index = 0; index < 4; index += 1) {
+    const toolCallId = `transient-${index}`;
+    guard.before({ toolName: "bash", toolCallId, input: { command } } as Parameters<typeof guard.before>[0]);
+    assert.equal(guard.after({ toolName: "bash", toolCallId, input: { command }, isError: true,
+      content: [{ type: "text", text: "render-queue: HyperFrames 退出码 1：device unavailable" }] } as Parameters<typeof guard.after>[0]), undefined);
+  }
 });
 
 test("unknown execution, source reads, external writes and setup are stopped before execution", () => {

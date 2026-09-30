@@ -107,6 +107,21 @@ export function TaskComposer(props: TaskComposerProps) {
         />
       </div>
 
+      <label className="check-row">
+        <input
+          id="reuse-visual-analysis"
+          type="checkbox"
+          checked={props.draft.reuseVisualAnalysis === true}
+          disabled={props.disabled || props.submitting}
+          aria-describedby="reuse-visual-analysis-hint"
+          onChange={(event) => update("reuseVisualAnalysis", event.target.checked)}
+        />
+        <span>
+          复用 AI 画面分析
+          <span className="field-hint" id="reuse-visual-analysis-hint">开启后复用已有分析，选镜仍看图。</span>
+        </span>
+      </label>
+
       <div className="composer-footer">
         <div className="count-control">
           <label htmlFor="generate-count">生成数量</label>

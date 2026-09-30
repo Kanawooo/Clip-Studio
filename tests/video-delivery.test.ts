@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { TaskManager } from "../src/tasks/manager.js";
 import { scanDeliveredOutputs } from "../src/tasks/delivery.js";
+import { createTaskAccessHandler } from "../src/pi/access-policy.js";
 
 const root = realpathSync(mkdtempSync(path.join(tmpdir(), "Clip Studio 中文 delivery ")));
 const projectRoot = path.resolve(".");
@@ -82,6 +83,87 @@ test("queue validates exact slot and selected audio timeline before render", asy
   writeFileSync(item.composition, readFileSync(item.composition, "utf8").replace(`data-duration="${item.duration.toFixed(3)}"`, 'data-duration="3"'));
   writeFileSync(item.manifestPath, JSON.stringify(item.manifest));
   await assert.rejects(validatedManifest(options), /工程时长.*主音频/);
+});
+
+test("queue template derives exact slots and never erases an existing retry manifest", async () => {
+  const { createManifestTemplate } = await import("../.pi/skills/hyperframes/hyperframes-cli/scripts/render-queue.mjs");
+  const item = fixture();
+  const file = path.join(item.workspace, "new-manifest.json");
+  const contractPath = path.join(item.deliveryDir, "contract.json");
+  const contract = JSON.parse(readFileSync(contractPath, "utf8"));
+  contract.slots.push(`Clip-Studio-${path.basename(item.taskDir)}-2-1234abcd.mp4`);
+  writeFileSync(contractPath, JSON.stringify(contract));
+  const options = { manifest: file, workspace: item.workspace, "output-dir": item.outputDir };
+  const result = await createManifestTemplate(options);
+  const template = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(result.rows, 2);
+  assert.equal(template.version, 1);
+  assert.equal(template.project, "video-project");
+  assert.deepEqual(template.rows.map((row: { output: string }) => row.output), contract.slots);
+  assert.equal(template.rows[1].composition, "compositions/02.html");
+  assert.equal(template.rows[0].mainAudio.source, "");
+  template.rows[0].status = "completed";
+  writeFileSync(file, JSON.stringify(template));
+  const original = readFileSync(file, "utf8");
+  await assert.rejects(createManifestTemplate(options), /已存在.*未覆盖/);
+  assert.equal(readFileSync(file, "utf8"), original);
+  await assert.rejects(createManifestTemplate({ ...options, manifest: path.join(item.outputDir, "wrong.json") }), /工作目录/);
+  await assert.rejects(createManifestTemplate({ ...options, manifest: path.join(item.workspace, "media-policy.json") }), /任务配置/);
+});
+
+test("manifest validation reports version, structure, count and exact field corrections", async () => {
+  const { validatedManifest } = await import("../.pi/skills/hyperframes/hyperframes-cli/scripts/render-queue.mjs");
+  const item = fixture();
+  const options = { manifest: item.manifestPath, workspace: item.workspace, "output-dir": item.outputDir };
+  const cases: Array<[unknown, RegExp]> = [
+    [[], /\[VALIDATION:ROOT\].*顶层必须是对象/],
+    [{ ...item.manifest, version: "1" }, /\[VALIDATION:VERSION\].*version.*数字 1/],
+    [{ version: 1, project: "video-project", renders: item.manifest.rows }, /\[VALIDATION:ROWS\].*rows.*renders\/videos/],
+    [{ ...item.manifest, rows: [] }, /\[VALIDATION:ROW_COUNT\].*实际 0 行/],
+    [{ ...item.manifest, project: item.project }, /\[VALIDATION:PROJECT\].*project/],
+    [{ ...item.manifest, project: "missing-project" }, /\[VALIDATION:PATH_MISSING\].*project.*路径不存在/],
+    [{ ...item.manifest, settings: { fps: 25 } }, /\[VALIDATION:FPS\].*settings\.fps/],
+    [{ ...item.manifest, settings: { quality: "maximum" } }, /\[VALIDATION:QUALITY\].*settings\.quality/],
+    [{ ...item.manifest, settings: { format: "webm" } }, /\[VALIDATION:FORMAT\].*settings\.format/],
+    [{ ...item.manifest, settings: { crf: -1 } }, /\[VALIDATION:CRF\].*settings\.crf/],
+    [{ ...item.manifest, rows: [null] }, /\[VALIDATION:ROW\].*rows\[0\]/],
+    [{ ...item.manifest, rows: [{ ...item.manifest.rows[0], composition: "01.js" }] }, /\[VALIDATION:COMPOSITION\].*composition.*相对 project/],
+    [{ ...item.manifest, rows: [{ ...item.manifest.rows[0], output: "test.mp4" }] }, /\[VALIDATION:OUTPUT\].*output.*预留位置/],
+    [{ ...item.manifest, rows: [{ ...item.manifest.rows[0], mainAudio: {} }] }, /\[VALIDATION:MAIN_AUDIO\].*mainAudio.*缺少主音频/],
+  ];
+  for (const [value, error] of cases) {
+    writeFileSync(item.manifestPath, JSON.stringify(value));
+    await assert.rejects(validatedManifest(options), error);
+  }
+  writeFileSync(item.manifestPath, "{not valid JSON}");
+  await assert.rejects(validatedManifest(options), /\[VALIDATION:JSON\].*JSON 解析失败/);
+  writeFileSync(item.manifestPath, JSON.stringify(item.manifest));
+  assert.equal((await validatedManifest(options)).rows.length, 1, "a corrected manifest immediately becomes usable");
+});
+
+test("admitted chained probes and public help execute in real Windows Git Bash", () => {
+  const item = fixture();
+  const assetsDir = path.join(root, "链式 查询素材");
+  mkdirSync(assetsDir, { recursive: true });
+  const referenceVideo = path.join(root, "链式 参考视频.mp4");
+  video(referenceVideo);
+  const tasksDir = path.join(root, "链式 任务数据");
+  const workspace = path.join(tasksDir, "chain-task", "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const sourceAudio = path.join(item.audioDir, "链式 音频.mp3");
+  copyFileSync(item.source, sourceAudio);
+  const access = createTaskAccessHandler({ projectRoot, tasksDir, workspace,
+    referenceVideo, assetsDir, audioDir: item.audioDir, outputDir: item.outputDir });
+  const q = (file: string) => `"${file.replace(/\\/g, "/")}"`;
+  const queue = path.join(projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs");
+  const cli = path.join(projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs");
+  const command = `cd ${q(workspace)} && ${q(ffprobe)} -v error -show_format -of json ${q(referenceVideo)} && ${q(ffprobe)} -v error -show_format -of json ${q(sourceAudio)} && ${q(process.execPath)} ${q(queue)} run --help && ${q(process.execPath)} ${q(cli)} transcribe --help`;
+  assert.equal(access({ toolName: "bash", input: { command } } as Parameters<typeof access>[0]), undefined);
+  const output = execFileSync(path.join(projectRoot, ".runtime", "git", "bin", "bash.exe"), ["-lc", command],
+    { cwd: workspace, encoding: "utf8", timeout: 30_000, windowsHide: true });
+  assert.equal((output.match(/"duration"/g) ?? []).length, 2);
+  assert.match(output, /template\|run/);
+  assert.match(output, /transcribe/);
 });
 
 test("single main-audio source accepts an explicit trimmed interval", async () => {

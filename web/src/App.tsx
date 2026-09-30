@@ -336,7 +336,7 @@ export default function App() {
   );
 }
 
-function buildCreateInput(draft: TaskDraft, settings: AppSettings): CreateTaskInput {
+export function buildCreateInput(draft: TaskDraft, settings: AppSettings): CreateTaskInput {
   const modelCapabilityId = settings.modelCapability?.capabilityId;
   if (!modelCapabilityId) throw new Error("请先测试主模型的图片理解能力");
   return {
@@ -346,6 +346,7 @@ function buildCreateInput(draft: TaskDraft, settings: AppSettings): CreateTaskIn
     outputDir: draft.outputDir.trim(),
     taskRequest: draft.taskRequest.trim(),
     generateCount: Math.min(20, Math.max(1, draft.generateCount)),
+    reuseVisualAnalysis: draft.reuseVisualAnalysis === true,
     model: buildModelInput(settings),
     modelCapabilityId,
   };
