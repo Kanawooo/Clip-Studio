@@ -42,6 +42,31 @@ Clip Studio 的“开始制作”已授权直接输出成片。由你完成剪�
 
 新建当前任务工程时，使用提示给出的本地 HyperFrames 脚本绝对路径，执行 `HYPERFRAMES_SKIP_SKILLS=1 node "<本地脚本>" init video-project --non-interactive --example blank`，保留生成的根 `index.html`。`lint`/`check` 接收工程目录（例如 `node "<本地脚本>" lint "<工程目录>"`），不是单个 composition 文件，也不使用 `-c`。独立成片在清单中指定 `composition`；HTML 结构和 GSAP 引入方式直接读取本地 `hyperframes-core/references/minimal-composition.md`，命令参数查 `<命令> --help`。初始化生成的技能更新建议不属于视频任务，不执行。
 
+### 批量写入已决定的工程
+
+新建多条任务的初次正式工程使用批量 writer：先原生 write 一个包含多行的工程清单，再调用 writer 一次落盘，不先逐条 write HTML 再补调用。输出容量不足时按实际预算分批，尾批或补失败行允许只有一行；不同布局/content/template 可混合，不要求同款视频。单条、旧任务、模板/数据/字幕写入及局部 edit 保持原生路径。独立定位、文档读取和合法查询可同轮调用，这些纯文本操作不受四图限制。准备好后集中做必要 check；局部修改仅重查受影响工程，共享依赖变化重查所有相关项。保持主音频和正式交付校验。
+
+新多条渲染前核验原生 Session 中实际 writer 调用结果及对应工程；缺失时 `[VALIDATION:COMPOSITION_BATCH_REQUIRED]` 给出准确文件和合法命令，这是流程纠正。writer 和依赖其结果的 render-queue run 分开调用；先等 writer 成功/部分成功，再保留原渲染清单继续。局部 edit 不需重写整批。已有相同工程可幂等接入，skipped 不算新批量生成；已有不同工程不覆盖。
+
+选镜、时间线、字幕和效果由你确定后，可用队列入口同目录的 `write-compositions.mjs` 一次保存多条工程：`node <该脚本绝对路径> --workspace <当前工作目录> --manifest <工作目录中的工程 JSON>`。公开参数查 `--help`；本地 HyperFrames 版本查 `node <本地脚本绝对路径> --version`。批量写入清单与正式渲染清单各自保存：
+
+```json
+{
+  "version": 1,
+  "project": "video-project",
+  "fps": 30,
+  "template": "composition-template.html",
+  "rows": [
+    { "composition": "compositions/01.html", "mainAudio": { "source": "<准确音频路径>" }, "values": { "ID": "video-01", "DURATION": 30, "BODY": "<已决定的完整镜头与音轨 HTML>" } },
+    { "composition": "compositions/02.html", "mainAudio": { "source": "<准确音频路径>" }, "content": "<另一条已决定的完整工程 HTML>" }
+  ]
+}
+```
+
+模板位于工作目录；`{{ID}}` 等普通字段按 HTML 转义，`{{json:SHOTS}}` 安全序列化数据，`{{html:BODY}}` 插入你已写好的 HTML。每行可选择自己的 template，或直接提供 content；共享机械结构与独立布局均可。每个根有独立 `data-composition-id`，主音频及工程时长与正式队列规则一致，DURATION 使用实际选定音频时间线。完整 HTML 的结构、播放和效果仍遵循 HyperFrames 规范；之后沿用现有 check 和任务队列渲染。
+
+CLI 先检查全部行，再逐行落盘，返回 `saved / skipped / failed` 与具体行错误。相同内容可重复调用并跳过；已有不同内容会报告冲突，局部修正使用原生 edit。写入中断后保留已提交工程，重用同一清单补缺失项；特殊工程也可继续原生 write/edit。输入和模板均为数据文件，批量操作使用受控 CLI，不执行生成的 Node/Python 脚本。
+
 Run commands as `npx hyperframes ...` unless project instructions provide a wrapper. Obey the wrapper when present. The CLI requires Node.js 22 or newer and FFmpeg.
 
 ## Development loop

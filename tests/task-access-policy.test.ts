@@ -20,6 +20,7 @@ const outputDir = path.join(root, "输出 成片");
 const skillDoc = path.join(projectRoot, ".pi", "skills", "clip-skills", "SKILL.md");
 const mediaScript = path.join(projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs");
 const queueScript = path.join(projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs");
+const compositionScript = path.join(path.dirname(queueScript), "write-compositions.mjs");
 const hyperframes = path.join(projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs");
 const source = path.join(projectRoot, "src", "index.ts");
 const outside = path.join(root, "unrelated", "secret.txt");
@@ -28,7 +29,7 @@ for (const directory of [workspace, otherTask, assetsDir, audioDir, outputDir,
   path.dirname(queueScript), path.dirname(hyperframes), path.dirname(source), path.dirname(outside)]) {
   mkdirSync(directory, { recursive: true });
 }
-for (const file of [referenceVideo, skillDoc, mediaScript, queueScript, hyperframes, source, outside,
+for (const file of [referenceVideo, skillDoc, mediaScript, queueScript, compositionScript, hyperframes, source, outside,
   path.join(assetsDir, "素材.mp4"), path.join(audioDir, "配乐.mp3")]) writeFileSync(file, "fixture");
 
 const options = { projectRoot, tasksDir, workspace, referenceVideo, assetsDir, audioDir, outputDir };
@@ -188,6 +189,38 @@ test("template and compact media batch CLI forms remain confined to this task", 
   assert.equal(bash(`node ${q(mediaScript)} annotate-batch --manifest ${q(outside)} ${base}`)?.block, true);
   assert.equal(bash(`node ${q(mediaScript)} transcribe-batch --manifest ${q(manifest)} ${base} --output ${q(outside)}`)?.block, true);
   assert.equal(bash(`node ${q(queueScript)} template --manifest ${q(manifest)} ${base} --output-dir ${q(outputDir)} --project ../escape`)?.block, true);
+});
+
+test("trusted version, image locator and batch composition calls have scoped admitted forms", () => {
+  const base = `--workspace ${q(workspace)}`;
+  const id = "src-123456789abc", other = "ref-abcdef123456";
+  const manifest = path.join(workspace, "工程 清单.json");
+  for (const command of [`node ${q(hyperframes)} --version`, `node ${q(hyperframes)} -V`,
+    `cd ${q(assetsDir)} && node ${q(hyperframes)} --version`, `npx hyperframes --version`,
+    `node ${q(mediaScript)} locate ${base} --ids ${id},${other}`,
+    `node ${q(mediaScript)} entry ${base} --id ${id}`,
+    `node ${q(mediaScript)} check-plan ${base} --file ${q(manifest)} --allow-reuse`,
+    `node ${q(mediaScript)} check-plan --file ${q(manifest)}`,
+    `node ${q(compositionScript)} --help`,
+    `node ${q(compositionScript)} ${base} --manifest ${q(manifest)}`,
+    `node ${q(hyperframes)} --version && node ${q(mediaScript)} locate ${base} --ids ${id}`]) {
+    assert.equal(bash(command), undefined, command);
+  }
+  for (const command of [`node ${q(hyperframes)} --version ${q(outside)}`,
+    `node ${q(hyperframes)} --version && cat ${q(source)}`,
+    `node ${q(mediaScript)} locate ${base} --ids ../secret`,
+    `node ${q(mediaScript)} entry ${base} --id ${id} --file ${q(referenceVideo)}`,
+    `node ${q(mediaScript)} check-plan --workspace ${q(otherTask)} --file ${q(manifest)}`,
+    `node ${q(mediaScript)} check-plan ${base} --file ${q(outside)}`,
+    `node ${q(mediaScript)} check-plan ${base} --file ${q(manifest)} --allow-reuse --allow-reuse`,
+    `node ${q(mediaScript)} check-plan ${base} --file ${q(manifest)} --eval true`,
+    `node ${q(compositionScript)} ${base} --manifest ${q(outside)}`,
+    `node ${q(compositionScript)} ${base} --manifest ${q(manifest)} --workspace ${q(otherTask)}`,
+    `node ${q(compositionScript)} --workspace ${q(otherTask)} --manifest ${q(manifest)}`,
+    `node ${q(compositionScript)} ${base} --manifest ${q(manifest)} --eval true`]) {
+    assert.equal(bash(command)?.block, true, command);
+  }
+  assert.equal(call("read", { path: compositionScript })?.block, true, "trusted execution is not implementation read access");
 });
 
 test("backend-owned media preference remains readable but immutable through all admitted writes", (t) => {

@@ -11,6 +11,7 @@ import {
 import type { ModelConfig, ModelThinkingLevel } from "../tasks/types.js";
 import { createTaskModel } from "./model.js";
 import { createProjectResourceLoader } from "./skills.js";
+import { initializeCompositionBatch } from "./access-policy.js";
 
 /** Native Pi tools. Video workflow tools deliberately remain outside the backend. */
 export const NATIVE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
@@ -37,6 +38,8 @@ export interface PiVideoSessionOptions {
   outputDir: string;
   sessionDir?: string;
   resumeSessionFile?: string;
+  newTask?: boolean;
+  batchRequirementSessionFile?: string;
   model: ModelConfig;
 }
 
@@ -57,6 +60,10 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
   const sessionDir = options.sessionDir ?? path.join(options.workspace, ".pi-session");
   let session: AgentSession | null = null;
   try {
+    const sessionManager = options.resumeSessionFile
+      ? SessionManager.open(options.resumeSessionFile, sessionDir, options.workspace)
+      : SessionManager.create(options.workspace, sessionDir);
+    initializeCompositionBatch(sessionManager, options.workspace, options.newTask === true, options.batchRequirementSessionFile);
     ({ session } = await createAgentSession({
       cwd: options.workspace,
       agentDir: options.agentDir,
@@ -64,9 +71,7 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
       model,
       ...(thinkingLevel ? { thinkingLevel } : {}),
       resourceLoader,
-      sessionManager: options.resumeSessionFile
-        ? SessionManager.open(options.resumeSessionFile, sessionDir, options.workspace)
-        : SessionManager.create(options.workspace, sessionDir),
+      sessionManager,
       settingsManager: SettingsManager.inMemory({
         ...(process.env.PI_VIDEO_SHELL_PATH ? { shellPath: process.env.PI_VIDEO_SHELL_PATH } : {}),
         enableAnalytics: false,

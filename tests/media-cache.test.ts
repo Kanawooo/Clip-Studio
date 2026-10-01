@@ -6,10 +6,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { createReadToolDefinition } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/read.js";
+import { createWriteToolDefinition } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/write.js";
+import { createVisualContextHandler, createVisualRuntime } from "../src/pi/visual-context.js";
+import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 import {
   analysisRecord, annotateBatch, automaticParallelism, cacheFile, candidateWindow, detail,
   displayGeometry, entryDetails, fingerprint, indexTask, materializeTaskView, overview,
   readMediaPolicy, sampleTimes, sheet, sheetBatchSize, sheetLayout, transcribeBatch,
+  locate, mediaIds, createVisualEvidenceReader, checkTaskPlan, checkSelectionBatch, createVisualStateReader, imageProvenance,
 } from "../.pi/skills/clip-skills/scripts/media-cache.mjs";
 
 const root = mkdtempSync(path.join(tmpdir(), "clip-media-cache-"));
@@ -234,7 +238,9 @@ test("batched local transcription is resource-parallel and source/config-valid a
     return { text: "real engine fixture words", segments: [{ start: 0, end: 2, text: "real engine fixture words" }] };
   } };
   const rows = [1, 2].map((number) => ({ file: path.join(audio, `配音 ${number}.wav`), kind: "audio" }));
-  const first = await transcribeBatch({ workspace, manifest: manifest(workspace, rows) }, configured);
+  const audioIds = readFileSync(path.join(workspace,"media-catalog.jsonl"),"utf8").trim().split("\n")
+    .map(JSON.parse).filter((row) => row.id.startsWith("aud-")).map((row) => ({id:row.id}));
+  const first = await transcribeBatch({ workspace, manifest: manifest(workspace, audioIds) }, configured);
   assert.equal(first.concurrency, 2);
   assert.equal(peak, 2);
   assert.equal(calls, 2);
@@ -322,6 +328,121 @@ test("overview pages metadata without invoking FFmpeg or FFprobe again", { skip:
   assert.equal(json(compact.overviewFile).sources.length, 1);
 });
 
+test("compact catalogue IDs resolve exact pictures, work in batches and reject stale or conflicting identities", { skip: !hasMediaRuntime }, async () => {
+  const workspace = task("catalogue-id", false);
+  const indexed = await index(workspace);
+  const rows = readFileSync(indexed.catalogFile, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(rows.length, 4);
+  assert.ok(rows.every((row) => /^(ref|src|aud)-[a-f0-9]{12}$/.test(row.id)));
+  assert.ok(readFileSync(indexed.catalogFile, "utf8").length < readFileSync(indexed.indexFile, "utf8").length / 2);
+  const source = rows.find((row) => row.id.startsWith("src-"));
+  const located = await locate({ workspace, ids: rows.slice(0, 2).map((row) => row.id).join(",") });
+  assert.equal(located.entries[1].source, await fs.realpath(video));
+  assert.ok(located.entries[1].sheets.every((sheet) => existsSync(sheet.path)));
+  assert.equal(located.images[0].role, "reference");
+  assert.equal(located.images[1].role, "source");
+  assert.ok(located.images.every((image) => image.bytes === statSync(image.path).size && image.width > 0 && image.height > 0));
+  assert.ok(located.imageGroups.every((group) => group.length <= 4));
+  const entry = await entryDetails({workspace, id:source.id}, context);
+  assert.equal(entry.source, await fs.realpath(video));
+  assert.equal(entry.id, source.id);
+  const result = await annotateBatch({workspace, manifest:manifest(workspace, [{id:source.id,
+    observation:{text:"Looked at the whole isolated fixture", coverage:[[0,5]], complete:true}}])}, context);
+  assert.equal(result.saved[0].sourceKey, entry.sourceKey);
+  assert.ok(Number.isFinite(Date.parse(result.saved[0].observationCreatedAt)));
+  assert.match((await locate({workspace,ids:source.id})).entries[0].observation, /whole isolated/);
+  await assert.rejects(entryDetails({workspace,id:source.id,file:video},context), /只能填写一个/);
+  await assert.rejects(locate({workspace,ids:"src-000000000000"}), /未知素材 id/);
+  await assert.rejects(locate({workspace,ids:`${source.id},${source.id}`}), /不重复/);
+  const all = json(indexed.indexFile);
+  all.sources[0].sourceKey = "stale-key";
+  writeFileSync(indexed.indexFile, JSON.stringify(all));
+  const stale = mediaIds([{...all.sources[0],kind:"source"}])[0].id;
+  await assert.rejects(locate({workspace,ids:stale}), /已变化.*index/);
+});
+
+test("IDs distinguish same names and kinds; reorder is stable, changed identity gets a new ID", () => {
+  const views = [{kind:"source",sourceKey:"one",source:"a/name.mp4"},
+    {kind:"source",sourceKey:"two",source:"b/name.mp4"}, {kind:"reference",sourceKey:"one"}];
+  const first = mediaIds(views), reordered = mediaIds([...views].reverse()).reverse();
+  assert.deepEqual(first.map((row) => row.id), reordered.map((row) => row.id));
+  assert.equal(new Set(first.map((row) => row.id)).size, 3);
+  assert.notEqual(mediaIds([{...views[0],sourceKey:"changed"}])[0].id, first[0].id);
+});
+
+test("visual evidence requires current source, current-task successful coverage and compatible record", { skip: !hasMediaRuntime }, async () => {
+  const workspace = task("evidence-current", false), indexed = await index(workspace);
+  const source = json(indexed.indexFile).sources[0], image = source.sheets[0].path;
+  const readEvidence = createVisualEvidenceReader(workspace);
+  assert.deepEqual(await readEvidence([image]), []);
+  await annotateBatch({workspace,manifest:manifest(workspace,[{file:video,kind:"source",
+    observation:{text:"Only first second observed",coverage:[[0,1]],complete:false}}])},context);
+  assert.deepEqual(await readEvidence([image]), [], "uncovered page stays an actual image");
+  await annotateBatch({workspace,manifest:manifest(workspace,[{file:video,kind:"source",
+    observation:{text:"Whole isolated source observed",coverage:[[0,5]],complete:true}}])},context);
+  const valid = json(source.entry);
+  assert.equal((await readEvidence([image]))[0].text, "Whole isolated source observed");
+  for (const patch of [{originTaskId:"foreign"}, {version:9}, {sourceKey:"changed"}, {createdAt:"bad"}, {coverage:[[0,1]]}]) {
+    writeFileSync(source.entry, JSON.stringify({...valid,analysis:{...valid.analysis,
+      observation:{...valid.analysis.observation,...patch}}}));
+    assert.deepEqual(await readEvidence([image]), [], JSON.stringify(patch));
+  }
+  writeFileSync(source.entry, JSON.stringify(valid));
+  assert.equal((await readEvidence([image])).length, 1);
+  assert.deepEqual(await readEvidence([path.join(workspace,"missing.jpg"),reference]), []);
+  const foreign = task("evidence-foreign",true), foreignIndex = await index(foreign);
+  assert.deepEqual(await createVisualEvidenceReader(foreign)([json(foreignIndex.indexFile).sources[0].sheets[0].path]), [],
+    "enabled cross-task reuse does not prove this Session saw its pictures");
+});
+
+test("native context integration loads task-local evidence and leaves Session history and original JPEG intact", { skip: !hasMediaRuntime }, async () => {
+  const workspace = task("native-evidence",false), independentAssets = path.join(root,"Native 独立素材");
+  mkdirSync(independentAssets,{recursive:true});
+  const selectedVideo = path.join(independentAssets,"source.mp4"); await fs.copyFile(video,selectedVideo);
+  writeFileSync(path.join(workspace,"media-policy.json"),JSON.stringify({version:1,taskId:"native-evidence",reuseVisualAnalysis:false,
+    inputs:{referenceVideo:reference,assetsDir:independentAssets,audioDir:audio}}));
+  const indexed = await indexTask({workspace,reference,assets:independentAssets,audio},context);
+  const image = json(indexed.indexFile).sources[0].sheets[0].path;
+  const timestamp = Date.now();
+  const read = await createReadToolDefinition(workspace).execute("native-read",{path:image});
+  const result = await annotateBatch({workspace,manifest:manifest(workspace,[{file:selectedVideo,kind:"source",
+    observation:{text:"Observed actual isolated test imagery",coverage:[[0,5]],complete:true}}])},context);
+  const modelReply = (time:number,toolCallId:string,name:string,args:object) => ({role:"assistant",timestamp:time,
+    api:"openai-completions",provider:"fixture",model:"fixture",stopReason:"toolUse",
+    content:[{type:"toolCall",id:toolCallId,name,arguments:args}],usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,
+      cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}});
+  const messages = [modelReply(timestamp-1,"native-read","read",{path:image}),
+    {role:"toolResult",timestamp,toolCallId:"native-read",toolName:"read",isError:false,content:read.content},
+    modelReply(Date.parse(result.saved[0].observationCreatedAt),"native-save","bash",{command:
+      `node "${path.join(project,".pi/skills/clip-skills/scripts/media-cache.mjs")}" annotate-batch --workspace "${workspace}" --manifest "analyses.json"`}),
+    {role:"toolResult",timestamp:Date.now(),toolCallId:"native-save",toolName:"bash",isError:false,
+      content:[{type:"text",text:JSON.stringify(result)}]}] as ContextEvent["messages"];
+  const original = JSON.stringify(messages), bytes = readFileSync(image);
+  const handler = createVisualContextHandler({workspace,projectRoot:project});
+  const projected = await handler({type:"context",messages});
+  assert.ok(projected);
+  assert.equal(projected.messages[1].content.filter((block)=>block.type==="image").length,1,
+    "saved neutral prose cannot replace actual selection imagery");
+  assert.equal(JSON.stringify(messages),original);
+  assert.deepEqual(readFileSync(image),bytes);
+  assert.match(JSON.stringify(projected),/observationCreatedAt/);
+  const planFile = path.join(workspace, "selected-plan.json");
+  writeFileSync(planFile, JSON.stringify({ outputs: [], visual: { version: 1, taskId: "native-evidence", excluded: [image], active: [], finalized: false } }));
+  const verified = await checkTaskPlan({ workspace, file: planFile });
+  messages.push(modelReply(Date.now(), "native-check", "bash", {command:
+    `node "${path.join(project,".pi/skills/clip-skills/scripts/media-cache.mjs")}" check-plan --workspace "${workspace}" --file "${planFile}"`}) as any,
+    {role:"toolResult",timestamp:Date.now(),toolCallId:"native-check",toolName:"bash",isError:false,
+      content:[{type:"text",text:JSON.stringify(verified)}]});
+  assert.equal((await handler({type:"context",messages}))?.messages[1].content.filter((block)=>block.type==="image").length,0,
+    "actual native read plus successful current-file CLI decision permits projection");
+  writeFileSync(planFile, JSON.stringify({outputs:[],visual:{version:1,taskId:"native-evidence",excluded:[],active:[image],finalized:false}}));
+  assert.equal((await handler({type:"context",messages}))?.messages[1].content.filter((block)=>block.type==="image").length,1,
+    "changed selection restores image even before a new check result");
+  await fs.appendFile(selectedVideo,"changed identity fixture");
+  const changed = await handler({type:"context",messages});
+  assert.equal(changed?.messages[1].content.filter((block)=>block.type==="image").length,1);
+});
+
 test("legacy task workspaces recover selected roots from the backend record, not the index", { skip: !hasMediaRuntime }, async () => {
   const taskDir = path.join(root, "legacy-backend-task");
   const workspace = path.join(taskDir, "workspace");
@@ -340,4 +461,102 @@ test("public CLI help exits successfully without workspace, input or dependency 
   const cli = path.join(project, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs");
   const result = command(process.execPath, [cli, "transcribe-batch", "--help"]);
   assert.match(result, /transcribe-batch/);
+});
+
+test("visual decisions bind current-task sources and plan bytes; annotations/file presence alone authorize nothing", { skip: !hasMediaRuntime }, async () => {
+  const workspace = task("visual-plan-proof", false), indexed = await index(workspace);
+  const source = json(indexed.indexFile).sources[0], ref = json(indexed.indexFile).reference;
+  const file = path.join(workspace, "visual-plan.json");
+  const plan = { outputs: [], visual: { version: 1, taskId: "visual-plan-proof", excluded: [source.sheets[0].path], active: [], finalized: false } };
+  writeFileSync(file, JSON.stringify(plan));
+  const checked = await checkTaskPlan({ workspace, file });
+  assert.equal(checked.ok, true); assert.equal(checked.visual.excluded[0].sourceKey, source.sourceKey);
+  const reader = createVisualStateReader(workspace);
+  assert.equal((await reader([source.sheets[0].path], [checked.visual])).proofs.length, 1);
+  writeFileSync(file, JSON.stringify({ ...plan, visual: { ...plan.visual, active: [ref.sheets[0].path] } }));
+  assert.equal((await reader([source.sheets[0].path], [checked.visual])).proofs.length, 0, "changed plan invalidates old proof");
+  for (const patch of [{ taskId: "foreign" }, { excluded: [ref.sheets[0].path] },
+    { active: [source.sheets[0].path] }, { excluded: [reference] }, { finalized: true }]) {
+    writeFileSync(file, JSON.stringify({ ...plan, visual: { ...plan.visual, ...patch } }));
+    await assert.rejects(checkTaskPlan({ workspace, file }));
+  }
+  writeFileSync(file, JSON.stringify({ outputs: [] }));
+  assert.equal((await checkTaskPlan({ workspace, file })).visual, undefined, "legacy check result cannot authorize pruning");
+});
+
+test("native write saves validated batch without extra model round; pending, reread, corruption and unseen pages remain", { skip: !hasMediaRuntime }, async () => {
+  const workspace=task("selection-native",false), indexed=await index(workspace), view=json(indexed.indexFile).sources[0];
+  const located=await locate({workspace,ids:mediaIds([{...view,kind:"source"}])[0].id}), descriptor=located.images[0];
+  const file=path.join(workspace,"selections/one.json"), nativeRead=createReadToolDefinition(workspace), nativeWrite=createWriteToolDefinition(workspace);
+  const read=await nativeRead.execute("image-read",{path:descriptor.path});
+  const content=JSON.stringify({version:1,kind:"selection-batch",rows:[{image:descriptor.id,decisions:[{
+    from:descriptor.from,to:descriptor.to,decision:"selected",purpose:"match narration",reason:"clear subject"}]}]});
+  const reply=(id:string,name:string,args:object):any=>({role:"assistant",timestamp:Date.now(),api:"openai-completions",provider:"fixture",model:"fixture",stopReason:"toolUse",
+    content:[{type:"toolCall",id,name,arguments:args}],usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}});
+  const messages:any[]=[reply("image-read","read",{path:descriptor.path}),
+    {role:"toolResult",toolName:"read",toolCallId:"image-read",isError:false,timestamp:Date.now(),content:read.content},
+    reply("save","write",{path:file,content})];
+  const ctx:any={sessionManager:{getBranch:()=>messages.map((message,i)=>({type:"message",id:String(i),message}))}};
+  const write=await nativeWrite.execute("save",{path:file,content});
+  const event:any={type:"tool_result",toolName:"write",toolCallId:"save",input:{path:file,content},content:write.content,isError:false};
+  const runtime=createVisualRuntime({workspace,projectRoot:project});
+  const result=await runtime.selectionResult(event,ctx);
+  assert.notEqual(result?.isError,true); const proof=JSON.parse(result!.content[0].text).selection;
+  assert.equal(proof.images[0].sourceKey,view.sourceKey);assert.match(proof.images[0].imageHash,/^[a-f0-9]{64}$/);
+  messages.push({role:"toolResult",toolName:"write",toolCallId:"save",isError:false,timestamp:Date.now(),content:result!.content});
+  const projected=await runtime.context({type:"context",messages},ctx);
+  assert.equal(projected!.messages[1].content.filter((block:any)=>block.type==="image").length,0);
+  assert.equal(messages[1].content.filter((block:any)=>block.type==="image").length,1,"native transcript not modified");
+  const original=readFileSync(descriptor.path);
+  writeFileSync(descriptor.path,Buffer.concat([original,Buffer.from("changed")]));
+  assert.equal((await runtime.context({type:"context",messages},ctx))!.messages[1].content.filter((block:any)=>block.type==="image").length,1);
+  writeFileSync(descriptor.path,original);
+  const pending=JSON.parse(content);pending.rows[0].decisions[0].decision="pending";writeFileSync(file,JSON.stringify(pending));
+  assert.equal((await checkSelectionBatch({workspace,file})).selection.images[0].complete,false);
+  assert.equal((await runtime.context({type:"context",messages},ctx))!.messages[1].content.filter((block:any)=>block.type==="image").length,1);
+  const incomplete=JSON.parse(content);incomplete.rows[0].decisions[0].to=descriptor.to-0.1;writeFileSync(file,JSON.stringify(incomplete));
+  await assert.rejects(checkSelectionBatch({workspace,file}),/未覆盖整页/);
+  assert.equal((await runtime.selectionResult(event,ctx))?.isError,true);
+  writeFileSync(file,content);
+  const unseen={sessionManager:{getBranch:()=>[{type:"message",message:messages[2]}]}} as any;
+  assert.equal((await runtime.selectionResult(event,unseen))?.isError,true,"current file alone cannot prove model viewed image");
+  const sameTurn={sessionManager:{getBranch:()=>[{type:"message",message:{...messages[0],content:[...messages[0].content,...messages[2].content]}},
+    {type:"message",message:messages[1]}]}} as any;
+  assert.equal((await runtime.selectionResult(event,sameTurn))?.isError,true);
+});
+
+test("complete visual plan validates requested slots, source ranges, main audio and shot timeline", { skip: !hasMediaRuntime }, async () => {
+  const taskDir = path.join(root, "complete-visual-task"), workspace = path.join(taskDir, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(path.join(workspace, "media-policy.json"), JSON.stringify({ version: 1, taskId: "complete-visual-task", reuseVisualAnalysis: false,
+    inputs: { referenceVideo: reference, assetsDir: assets, audioDir: audio } }));
+  const indexed = await index(workspace), sources = json(indexed.indexFile);
+  const slot = "Clip-Studio-complete-visual-task-1-12345678.mp4";
+  mkdirSync(path.join(taskDir, "delivery"));
+  writeFileSync(path.join(taskDir, "delivery", "contract.json"), JSON.stringify({ version: 1, taskId: "complete-visual-task", workspace,
+    outputDir: root, audioDir: audio, slots: [slot] }));
+  const row = { output: slot, duration: 2, mainAudio: { source: sources.audio[0].source },
+    shots: [{ source: sources.sources[0].source, start: 0, end: 2 }] };
+  const plan = { outputs: [row], visual: { version: 1, taskId: "complete-visual-task", excluded: [], active: [], finalized: true } };
+  const file = path.join(workspace, "plan.json"); writeFileSync(file, JSON.stringify(plan));
+  const checked = await checkTaskPlan({ workspace, file });
+  assert.equal(checked.visual.finalized, true); assert.equal(checked.visual.required.length, 2);
+  for (const patch of [{ duration: 3 }, { output: "test.mp4" }, { mainAudio: null },
+    { shots: [{ source: sources.sources[0].source, start: 0, end: 8 }] },
+    { shots: [{ source: sources.sources[0].source, start: 0, end: 2, at: 1 }] }]) {
+    writeFileSync(file, JSON.stringify({ ...plan, outputs: [{ ...row, ...patch }] }));
+    await assert.rejects(checkTaskPlan({ workspace, file }));
+  }
+  writeFileSync(file, JSON.stringify({ ...plan, outputs: [row, row] }));
+  await assert.rejects(checkTaskPlan({ workspace, file }), /全部成片/);
+});
+
+test("local detail/window source-time provenance stays accurate with reuse off and never needs saved prose", { skip: !hasMediaRuntime }, async () => {
+  const workspace = task("detail-provenance", false);
+  const still = await detail({ file: video, at: 1.5, workspace, output: path.join(workspace, "高清 图.jpg"), original: true }, context);
+  assert.equal(still.images.length, 1); assert.equal(still.images[0].from, 1.5);
+  assert.equal(still.images[0].source, await fs.realpath(video)); assert.equal(still.images[0].frameCount, 1);
+  const window = await candidateWindow({ file: video, start: 1, end: 3, workspace }, context);
+  assert.ok(window.images.length); assert.equal(window.images[0].from, 1); assert.equal(window.images[0].to, 3);
+  assert.equal((await imageProvenance(workspace, [still.path, window.sheets[0].path])).length, 2);
 });

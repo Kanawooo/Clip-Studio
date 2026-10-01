@@ -47,13 +47,13 @@ const inside = (root, file) => {
   return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 };
 
-async function taskInput(workspace, file) {
+export async function taskInput(workspace, file) {
   const real = await fs.realpath(file);
   if (!inside(workspace, real)) throw new Error("分析清单/文本必须位于当前任务工作目录");
   return real;
 }
 
-async function taskOutput(workspace, file) {
+export async function taskOutput(workspace, file) {
   const supplied = path.resolve(file);
   const existing = await fs.lstat(supplied).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
   if (existing?.isSymbolicLink() || (existing && existing.nlink > 1)) throw new Error("输出不能覆盖任务策略或符号/硬链接");
@@ -111,7 +111,7 @@ export async function readMediaPolicy(workspace) {
 // A writable index is an observation artifact, never a source authorization.
 // New tasks carry these roots in the immutable policy; old task workspaces can
 // recover them from the backend-owned task record outside the writable scope.
-async function mediaAccess(workspace) {
+export async function mediaAccess(workspace) {
   const policy = await readMediaPolicy(workspace);
   let inputs = policy.inputs;
   if (!inputs) {
@@ -476,7 +476,7 @@ export async function indexTask(options, overrides = {}) {
   const indexFile = path.join(workspace, "media-index.json");
   await writeTaskJson(workspace, indexFile, result);
   const overviewFile = await saveOverview(workspace, result);
-  return { overviewFile, indexFile, sourceCount: sources.length, audioCount: sounds.length,
+  return { catalogFile: path.join(workspace, "media-catalog.jsonl"), overviewFile, indexFile, sourceCount: sources.length, audioCount: sounds.length,
     sourceCacheHits: sources.filter((item) => item.cacheHit).length, concurrency };
 }
 
@@ -492,6 +492,51 @@ export function analysisRecord(record, sourceKey, duration) {
   catch { return { state: "incompatible", text: null, coverage: [] }; }
   const full = record.complete === true && coverage.length === 1 && coverage[0][0] <= 0.05 && coverage[0][1] >= duration - 0.05;
   return { ...record, coverage, state: full ? "full" : "partial" };
+}
+
+// Read only the relevant task-local views. No decoding, probing, cache writes or model calls.
+// Invalid/legacy/foreign records fail closed: their images remain in native context.
+export function createVisualEvidenceReader(workspace) {
+  const identities = new Map();
+  return (images) => visualEvidence({ workspace, images }, identities);
+}
+
+export async function visualEvidence({ workspace, images }, identities = new Map()) {
+  workspace = await fs.realpath(workspace);
+  const access = await mediaAccess(workspace);
+  const entries = new Map();
+  const result = [];
+  for (const image of images) {
+    try {
+      const actual = await taskInput(workspace, image);
+      const entryFile = path.join(path.dirname(actual), "entry.json");
+      let view = entries.get(entryFile);
+      if (!view) {
+        view = JSON.parse(await fs.readFile(await taskInput(workspace, entryFile), "utf8"));
+        const source = await access.file(view.source, view.kind);
+        const stat = await fs.stat(source);
+        const signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+        let identity = identities.get(source);
+        if (!identity || identity.signature !== signature) {
+          identity = { signature, key: (await fingerprint(source)).key };
+          identities.set(source, identity);
+        }
+        if (identity.key !== view.sourceKey) continue;
+        entries.set(entryFile, view);
+      }
+      const record = analysisRecord(view.analysis?.observation, view.sourceKey, view.duration);
+      if (!["partial", "full"].includes(record.state) || record.originTaskId !== access.policy.taskId
+        || !record.text?.trim() || !Number.isFinite(Date.parse(record.createdAt))) continue;
+      const sheet = view.sheets?.find((item) => path.resolve(item.path).toLowerCase() === actual.toLowerCase());
+      const frame = view.frames?.find((item) => path.resolve(item.path).toLowerCase() === actual.toLowerCase());
+      const from = sheet?.firstSecond ?? frame?.at, to = sheet?.lastSecond ?? frame?.at;
+      if (!Number.isFinite(from) || !Number.isFinite(to) || to < from
+        || !record.coverage.some(([start, end]) => start <= from && end >= to)) continue;
+      result.push({ path: actual, entry: entryFile, source: view.source, sourceKey: view.sourceKey, from, to,
+        text: record.text, createdAt: record.createdAt });
+    } catch { /* A missing/changed image or record is retained, not guessed. */ }
+  }
+  return result;
 }
 
 function normalizeCoverage(coverage, duration) {
@@ -528,7 +573,7 @@ function newRecord(value, item, policy, config) {
 }
 
 const summary = (view) => ({
-  source: view.source, kind: view.kind, sourceKey: view.sourceKey, duration: view.duration,
+  id: mediaId(view), source: view.source, kind: view.kind, sourceKey: view.sourceKey, duration: view.duration,
   cacheHit: view.cacheHit, geometry: view.geometry, entry: view.entry,
   sheets: view.sheets.map(({ path: sheetPath, firstSecond, lastSecond, frameCount, width, height }) =>
     ({ path: sheetPath, firstSecond, lastSecond, frameCount, width, height })),
@@ -537,9 +582,46 @@ const summary = (view) => ({
   transcriptState: view.analysis?.transcript.state ?? "absent",
 });
 
+export function mediaId(view) {
+  // Full identity remains internal; extending colliding prefixes is deterministic across list order.
+  const prefix = { reference: "ref", source: "src", audio: "aud" }[view.kind];
+  return `${prefix}-${createHash("sha256").update(`${view.kind}:${view.sourceKey}`).digest("hex").slice(0, 12)}`;
+}
+
+export function mediaIds(views) {
+  const hashes = views.map((view) => createHash("sha256").update(`${view.kind}:${view.sourceKey}`).digest("hex"));
+  return views.map((view, index) => {
+    let length = 12;
+    while (hashes.some((hash, other) => other !== index && hash !== hashes[index]
+      && hash.slice(0, length) === hashes[index].slice(0, length))) length += 2;
+    return { ...view, id: `${mediaId(view).split("-")[0]}-${hashes[index].slice(0, length)}` };
+  });
+}
+
+async function saveCatalog(workspace, index) {
+  const rows = mediaIds([{ ...index.reference, kind: "reference" },
+    ...index.sources.map((view) => ({ ...view, kind: "source" })),
+    ...index.audio.map((view) => ({ ...view, kind: "audio" }))]).map((view) => ({
+    id: view.id, name: path.basename(view.source), seconds: view.duration,
+    ...(view.geometry ? { aspect: Number(view.geometry.aspect.toFixed(4)) } : {}),
+    pages: view.sheets.length, observation: view.analysis?.observation.state ?? "absent",
+    transcript: view.analysis?.transcript.state ?? "absent",
+  }));
+  const target = await taskOutput(workspace, path.join(workspace, "media-catalog.jsonl"));
+  const temporary = await taskOutput(workspace, `${target}.${randomUUID()}.tmp`);
+  await fs.writeFile(temporary, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+  try { await fs.rename(temporary, target); }
+  finally { await fs.rm(temporary, { force: true }); }
+  return target;
+}
+
 async function saveOverview(workspace, index, offset = 0, limit = 25) {
   if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("overview --offset 需非负整数，--limit 需 1–100");
-  const compact = (view) => ({ source: view.source, duration: view.duration, cacheHit: view.cacheHit,
+  await saveCatalog(workspace, index);
+  const ids = new Map(mediaIds([{ ...index.reference, kind: "reference" },
+    ...index.sources.map((view) => ({ ...view, kind: "source" })),
+    ...index.audio.map((view) => ({ ...view, kind: "audio" }))]).map((view) => [`${view.kind}:${view.sourceKey}`, view.id]));
+  const compact = (view) => ({ id: ids.get(`${view.kind}:${view.sourceKey}`), source: view.source, duration: view.duration, cacheHit: view.cacheHit,
     ...(view.geometry ? { aspect: Number(view.geometry.aspect.toFixed(4)) } : {}),
     sheets: view.sheets.map((entry) => ({ path: entry.path, from: entry.firstSecond, to: entry.lastSecond })),
     observationState: view.analysis.observation.state, observation: view.observation?.slice(0, 160) ?? null,
@@ -552,18 +634,25 @@ async function saveOverview(workspace, index, offset = 0, limit = 25) {
   });
 }
 
-async function indexedSources(workspace) {
+async function indexedSources(workspace, validateAll = true) {
   const file = await taskInput(workspace, path.join(workspace, "media-index.json"));
   const index = JSON.parse(await fs.readFile(file, "utf8"));
   if (!index.reference || !Array.isArray(index.sources) || !Array.isArray(index.audio)) throw new Error("media-index.json 无效，请先执行 index");
-  const all = [{ ...index.reference, kind: "reference" },
-    ...index.sources.map((item) => ({ ...item, kind: "source" })), ...index.audio.map((item) => ({ ...item, kind: "audio" }))];
+  const all = mediaIds([{ ...index.reference, kind: "reference" },
+    ...index.sources.map((item) => ({ ...item, kind: "source" })), ...index.audio.map((item) => ({ ...item, kind: "audio" }))]);
   const access = await mediaAccess(workspace);
-  for (const item of all) await access.file(item.source, item.kind);
+  if (validateAll) for (const item of all) await access.file(item.source, item.kind);
   return { index, all, policy: access.policy };
 }
 
-async function matchIndexed(all, file, kind) {
+async function matchIndexed(all, file, kind, id) {
+  if (id !== undefined) {
+    if (file !== undefined) throw new Error("file 和 id 只能填写一个");
+    const item = all.find((entry) => entry.id === id && (!kind || entry.kind === kind));
+    if (!item) throw new Error(`未知素材 id：${id}；读取 media-catalog.jsonl 获取准确标识`);
+    if ((await fingerprint(item.source)).key !== item.sourceKey) throw new Error(`素材 ${id} 已变化，请重新执行 index`);
+    return item;
+  }
   if (typeof file !== "string") throw new Error("分析清单每行需要 file");
   const real = await fs.realpath(file);
   const item = all.find((entry) => entry.source.toLowerCase() === real.toLowerCase() && entry.kind === kind);
@@ -586,12 +675,259 @@ async function replaceIndexView(workspace, index, view) {
 export async function entryDetails(options, overrides = {}) {
   const workspace = await fs.realpath(options.workspace);
   const { index, all } = await indexedSources(workspace);
-  const kind = options.kind || "source";
-  const indexed = await matchIndexed(all, options.file, kind);
+  const indexed = await matchIndexed(all, options.file, options.kind || (options.id ? undefined : "source"), options.id);
+  const kind = indexed.kind;
   const item = await cacheFile(indexed.source, kind, overrides);
   const view = await materializeTaskView(item, workspace, kind);
   await replaceIndexView(workspace, index, view);
-  return { entry: view.entry, ...summary(view) };
+  return { entry: view.entry, ...summary(view), id: indexed.id };
+}
+
+export async function locate(options) {
+  const workspace = await fs.realpath(options.workspace);
+  const { all, policy } = await indexedSources(workspace);
+  const ids = String(options.ids ?? "").split(",").filter(Boolean);
+  if (!ids.length || new Set(ids).size !== ids.length) throw new Error("locate --ids 需要逗号分隔且不重复的素材标识");
+  const entries = [], images = [];
+  for (const id of ids) {
+    const indexed = await matchIndexed(all, undefined, undefined, id);
+    const view = JSON.parse(await fs.readFile(await taskInput(workspace, indexed.entry), "utf8"));
+    if (view.sourceKey !== indexed.sourceKey || view.source !== indexed.source) throw new Error(`素材 ${id} 详情失效，请执行 index`);
+    const record = view.analysis?.observation;
+    const observation = ((view.kind !== "reference" && policy.reuseVisualAnalysis) || record?.originTaskId === policy.taskId)
+      ? analysisRecord(record, view.sourceKey, view.duration) : analysisRecord(null, view.sourceKey, view.duration);
+    for (const [page, sheet] of view.sheets.entries()) {
+      const actual = await taskInput(workspace, sheet.path);
+      images.push({ id: `${id}:page-${page + 1}`, mediaId: id, path: actual, source: view.source,
+        sourceKey: view.sourceKey, role: view.kind, entry: view.entry, page: page + 1,
+        from: sheet.firstSecond, to: sheet.lastSecond, frameCount: sheet.frameCount,
+        width: sheet.width, height: sheet.height, bytes: (await fs.stat(actual)).size });
+    }
+    entries.push({ ...summary({ ...view, observation: observation.text, analysis: { ...view.analysis, observation } }), id });
+  }
+  return { entries, images, imageGroups: Array.from({ length: Math.ceil(images.length / 4) },
+    (_, index) => images.slice(index * 4, index * 4 + 4).map((image) => image.path)),
+    grouping: { defaultNewImages: 4, capacity: "client default; native Session refines using full history" } };
+}
+
+// Provenance is independent of saved prose. Only selected, task-local image
+// metadata and source fingerprints are inspected; no decoding or library scan.
+export async function imageProvenance(workspace, images, identities = new Map()) {
+  workspace = await fs.realpath(workspace);
+  const access = await mediaAccess(workspace), views = new Map(), result = [];
+  for (const image of images) {
+    try {
+      const actual = await taskInput(workspace, image);
+      let entry = path.join(path.dirname(actual), "entry.json");
+      if (!(await fs.stat(entry).catch(() => null))) entry = `${actual}.visual.json`;
+      let view = views.get(entry);
+      if (!view) {
+        view = JSON.parse(await fs.readFile(await taskInput(workspace, entry), "utf8"));
+        const source = await access.file(view.source, view.kind);
+        const stat = await fs.stat(source), signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+        let identity = identities.get(source);
+        if (!identity || identity.signature !== signature) {
+          identity = { signature, key: (await fingerprint(source)).key }; identities.set(source, identity);
+        }
+        if (identity.key !== view.sourceKey) continue;
+        views.set(entry, view);
+      }
+      const matchingPath = async (candidate) => {
+        if (path.resolve(candidate).toLowerCase() === actual.toLowerCase()) return true;
+        if (path.basename(candidate).toLowerCase() !== path.basename(actual).toLowerCase()) return false;
+        return (await fs.realpath(candidate)).toLowerCase() === actual.toLowerCase();
+      };
+      let page = -1;
+      for (const [index, item] of (view.sheets ?? []).entries()) if (await matchingPath(item.path)) { page = index; break; }
+      const sheet = page >= 0 ? view.sheets[page] : undefined;
+      let frame;
+      if (!sheet) for (const item of view.frames ?? []) if (await matchingPath(item.path)) { frame = item; break; }
+      const from = sheet?.firstSecond ?? frame?.at, to = sheet?.lastSecond ?? frame?.at;
+      if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to < from || to > view.duration + 0.05) continue;
+      result.push({ path: actual, entry, source: view.source, sourceKey: view.sourceKey, role: view.kind,
+        id: `${mediaId(view)}:${sheet ? `page-${page + 1}` : `frame-${frame.at}`}`,
+        from, to, page: sheet ? page + 1 : null, frameCount: sheet?.frameCount ?? 1,
+        width: sheet?.width ?? view.geometry?.width, height: sheet?.height ?? view.geometry?.height,
+        bytes: (await fs.stat(actual)).size });
+    } catch { /* Unknown/detail/changed image stays actual; never infer completion. */ }
+  }
+  return result;
+}
+
+/** Optional visual contract. Old check-plan remains a duplicate-shot check. */
+export async function checkTaskPlan(options) {
+  const workspace = await fs.realpath(options.workspace);
+  const file = await taskInput(workspace, options.file);
+  const data = await fs.readFile(file), plan = JSON.parse(data.toString("utf8"));
+  const checked = checkPlan(plan, options["allow-reuse"]);
+  if (!plan.visual) return checked;
+  const { all, policy } = await indexedSources(workspace);
+  const visual = plan.visual;
+  if (visual.version !== 1 || visual.taskId !== policy.taskId || !Array.isArray(visual.excluded)
+    || !Array.isArray(visual.active) || typeof visual.finalized !== "boolean") {
+    throw new Error("visual 需要 version:1、本任务 taskId、excluded/active 图片路径数组及 finalized 布尔值");
+  }
+  const requested = [...visual.excluded, ...visual.active];
+  if (requested.some((value) => typeof value !== "string") || new Set(requested).size !== requested.length) {
+    throw new Error("visual 图片路径必须准确、互不重复，active 与 excluded 不能重叠");
+  }
+  const images = await imageProvenance(workspace, requested);
+  if (images.length !== requested.length) throw new Error("visual 图片身份/范围失效，请 locate 当前任务准确图片，不重扫未变化素材");
+  const excluded = images.slice(0, visual.excluded.length), active = images.slice(visual.excluded.length);
+  if (excluded.some((image) => image.role === "reference")) throw new Error("选镜期间参考图保持活跃；全部选镜确认后由 finalized 减载");
+  const required = [];
+  if (visual.finalized) {
+    // Backend-owned immutable contract, outside Pi's writable workspace.
+    const contractFile = path.join(workspace, "..", "delivery", "contract.json");
+    const real = await fs.realpath(contractFile);
+    if (real.toLowerCase() !== path.resolve(contractFile).toLowerCase()) throw new Error("交付契约路径异常");
+    const contract = JSON.parse(await fs.readFile(real, "utf8"));
+    if (contract.version !== 1 || contract.taskId !== policy.taskId
+      || (await fs.realpath(contract.workspace)).toLowerCase() !== workspace.toLowerCase()
+      || !Array.isArray(contract.slots) || !contract.slots.length || contract.slots.length > 20
+      || !Array.isArray(plan.outputs) || plan.outputs.length !== contract.slots.length || !checked.ok) {
+      throw new Error("finalized 需要本任务全部成片方案和有效交付契约，不能只设置布尔值");
+    }
+    const sourceViews = new Map();
+    const viewFor = async (source, kinds) => {
+      if (typeof source !== "string" || !source) throw new Error("方案需要索引中准确的 source 路径");
+      const actual = await fs.realpath(path.resolve(workspace, source));
+      const item = all.find((row) => row.source.toLowerCase() === actual.toLowerCase() && kinds.includes(row.kind));
+      if (!item || (await fingerprint(actual)).key !== item.sourceKey) throw new Error("方案源文件不在当前有效索引内，请使用 locate 的准确 source");
+      if (!sourceViews.has(item.entry)) sourceViews.set(item.entry, JSON.parse(await fs.readFile(await taskInput(workspace, item.entry), "utf8")));
+      const view = sourceViews.get(item.entry);
+      if (view.sourceKey !== item.sourceKey || view.source !== item.source) throw new Error("方案素材详情身份失效");
+      return view;
+    };
+    const reference = all.find((item) => item.kind === "reference");
+    if (!reference) throw new Error("缺少参考视频索引");
+    const referenceView = await viewFor(reference.source, ["reference"]);
+    required.push(...referenceView.sheets.map((sheet) => sheet.path));
+    for (const [index, output] of plan.outputs.entries()) {
+      if (output.output !== contract.slots[index] || !Number.isFinite(output.duration) || output.duration <= 0
+        || !Array.isArray(output.shots) || !output.shots.length) throw new Error(`outputs[${index}] 需要正式槽位、duration 和非空 shots`);
+      let audioEnd = 0;
+      if (contract.silentDuration && output.silentDuration === contract.silentDuration) audioEnd = contract.silentDuration;
+      else {
+        const segments = output.mainAudio?.segments ?? (output.mainAudio?.source ? [output.mainAudio] : []);
+        if (!Array.isArray(segments) || !segments.length) throw new Error(`outputs[${index}] 缺少主音频时间线`);
+        for (const segment of segments) {
+          const view = await viewFor(segment.source, ["audio"]);
+          const from = segment.from ?? 0, to = segment.to ?? view.duration, at = segment.at ?? audioEnd, rate = segment.rate ?? 1;
+          if (![from, to, at, rate].every(Number.isFinite) || from < 0 || to <= from || to > view.duration + 0.08
+            || rate <= 0 || rate > 8 || Math.abs(at - audioEnd) > 0.08) throw new Error(`outputs[${index}] 主音频区间无效或未连续`);
+          audioEnd = at + (to - from) / rate;
+        }
+      }
+      if (Math.abs(output.duration - audioEnd) > 0.12) throw new Error(`outputs[${index}] duration 与主音频时间线不符`);
+      let shotEnd = 0;
+      for (const shot of output.shots) {
+        const view = await viewFor(shot.source, ["source"]);
+        const at = shot.at ?? shotEnd, rate = shot.rate ?? 1;
+        if (shot.end > view.duration + 0.05 || !Number.isFinite(rate) || rate <= 0 || rate > 8
+          || !Number.isFinite(at) || at < 0 || at > shotEnd + 0.08) throw new Error(`outputs[${index}] 镜头范围或连续时间线无效`);
+        shotEnd = Math.max(shotEnd, at + (shot.end - shot.start) / rate);
+        const relevant = view.sheets.filter((sheet) => sheet.lastSecond >= shot.start && sheet.firstSecond < shot.end);
+        if (!relevant.length) throw new Error(`outputs[${index}] 镜头没有可定位画面`);
+        required.push(...relevant.map((sheet) => sheet.path));
+      }
+      if (Math.abs(shotEnd - output.duration) > 0.12) throw new Error(`outputs[${index}] 镜头未覆盖主音频时间线`);
+    }
+  }
+  const needed = [...new Set(required)];
+  if (needed.some((image) => visual.excluded.includes(image))) throw new Error("已排除图片与完整方案选镜冲突");
+  const requiredImages = await imageProvenance(workspace, needed);
+  if (requiredImages.length !== needed.length) throw new Error("完整方案所需图片身份失效");
+  return { ...checked, visual: { version: 1, taskId: policy.taskId, file,
+    sha256: createHash("sha256").update(data).digest("hex"), excluded, active,
+    finalized: visual.finalized, required: requiredImages } };
+}
+
+/** Small current-task selection files are decisions, not neutral observation prose.
+ * Native Session read/write association is verified by the extension, not here. */
+export async function checkSelectionBatch(options, identities = new Map(), tolerateStale = false) {
+  const workspace = await fs.realpath(options.workspace);
+  const file = await taskInput(workspace, path.resolve(workspace, options.file));
+  const relative = path.relative(workspace, file).replace(/\\/g, "/");
+  if (!/^selections\/[^/]+\.json$/i.test(relative)) throw new Error("选镜记录写入 selections/<批次>.json");
+  const data = await fs.readFile(file), batch = JSON.parse(data.toString("utf8"));
+  // Only mentioned sources are admitted/fingerprinted below; no directory scan.
+  const { all, policy } = await indexedSources(workspace, false);
+  if (batch.version !== 1 || batch.kind !== "selection-batch" || !Array.isArray(batch.rows) || !batch.rows.length)
+    throw new Error("选镜记录需要 version:1、kind:selection-batch 和非空 rows");
+  const images = [], names = new Set();
+  for (const [index, row] of batch.rows.entries()) {
+    try {
+      if (!row || typeof row.image !== "string" || !Array.isArray(row.decisions) || !row.decisions.length)
+        throw new Error("需要准确 image 标识/路径和 decisions");
+      let image = row.image;
+      if (!path.isAbsolute(image) && !image.includes("/") && !image.includes("\\") && image.includes(":page-")) {
+        const separator = image.lastIndexOf(":page-");
+        const entry = await matchIndexed(all, undefined, undefined, image.slice(0, separator));
+        const view = JSON.parse(await fs.readFile(await taskInput(workspace, entry.entry), "utf8"));
+        const page = Number(image.slice(separator + 6));
+        if (!Number.isInteger(page) || page < 1 || !view.sheets?.[page - 1]) throw new Error("图片页标识失效，请 locate");
+        image = view.sheets[page - 1].path;
+      }
+      const [evidence] = await imageProvenance(workspace, [path.resolve(workspace, image)], identities);
+      if (!evidence || evidence.role !== "source") throw new Error("需要本任务有效素材图片；参考图在完整方案确认前保留");
+      if (names.has(evidence.path.toLowerCase())) throw new Error("image 重复");
+      names.add(evidence.path.toLowerCase());
+      let end = evidence.from;
+      const decisions = row.decisions.map((decision) => {
+        if (!decision || !["selected", "discarded", "pending"].includes(decision.decision)
+          || ![decision.from, decision.to].every(Number.isFinite) || decision.from < evidence.from
+          || decision.to < decision.from || decision.to > evidence.to || decision.from !== end
+          || typeof decision.reason !== "string" || !decision.reason.trim() || decision.reason.length > 2000
+          || (decision.decision === "selected" && (typeof decision.purpose !== "string" || !decision.purpose.trim())))
+          throw new Error("decisions 需按页范围连续覆盖、合法区间及取舍原因；selected 需 purpose，未看清填 pending");
+        if (/\b(?:sk-[A-Za-z0-9_-]{8,}|authorization\s*:|api[_-]?key\s*[:=]|bearer\s+[A-Za-z0-9_-]{8,})/i.test(`${decision.reason} ${decision.purpose ?? ""}`))
+          throw new Error("选镜记录包含疑似密钥");
+        if (decision.purpose?.length > 2000) throw new Error("purpose 超过 2000 字符");
+        end = decision.to;
+        return { from: decision.from, to: decision.to, decision: decision.decision, reason: decision.reason,
+          ...(decision.decision === "selected" ? { purpose: decision.purpose } : {}) };
+      });
+      if (end !== evidence.to) throw new Error("decisions 未覆盖整页；未决定的剩余区间填 pending");
+      const stat = await fs.stat(evidence.path), signature = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+      const cacheKey = `image:${evidence.path}`;
+      let imageIdentity = identities.get(cacheKey);
+      if (!imageIdentity || imageIdentity.signature !== signature) {
+        imageIdentity = { signature, hash: createHash("sha256").update(await fs.readFile(evidence.path)).digest("hex") };
+        identities.set(cacheKey, imageIdentity);
+      }
+      const imageHash = imageIdentity.hash;
+      images.push({ ...evidence, imageHash, decisions, complete: decisions.every((item) => item.decision !== "pending") });
+    } catch (error) {
+      if (!tolerateStale) throw new Error(`rows[${index}]：${error.message}`);
+    }
+  }
+  return { ok: true, selection: { version: 1, taskId: policy.taskId, file,
+    sha256: createHash("sha256").update(data).digest("hex"), images } };
+}
+
+export function createVisualStateReader(workspace) {
+  const identities = new Map();
+  return async (images, proofs, selections = []) => {
+    const evidence = await imageProvenance(workspace, images, identities), verified = [], verifiedSelections = [];
+    for (const proof of proofs) {
+      try {
+        const result = await checkTaskPlan({ workspace, file: proof.file, "allow-reuse": proof.limitedReuseAllowed });
+        if (result.ok && result.visual?.sha256 === proof.sha256 && result.visual.taskId === proof.taskId) verified.push(result.visual);
+      } catch { /* Modified/failed/foreign plans do not authorize removal. */ }
+    }
+    for (const proof of selections) {
+      try {
+        const result = await checkSelectionBatch({ workspace, file: proof.file }, identities, true);
+        if (result.selection.sha256 === proof.sha256 && result.selection.taskId === proof.taskId) {
+          result.selection.images = result.selection.images.filter((image) => proof.images.some((old) =>
+            old.path === image.path && old.sourceKey === image.sourceKey && old.imageHash === image.imageHash));
+          verifiedSelections.push(result.selection);
+        }
+      } catch { /* Changed record invalidates this batch, not unrelated batches. */ }
+    }
+    return { images: evidence, proofs: verified, selections: verifiedSelections };
+  };
 }
 
 export async function overview(options, overrides = {}) {
@@ -615,7 +951,7 @@ export async function overview(options, overrides = {}) {
   index.sources = views.filter((view) => view.kind === "source");
   index.audio = views.filter((view) => view.kind === "audio");
   await writeTaskJson(workspace, path.join(workspace, "media-index.json"), index);
-  return { overviewFile: await saveOverview(workspace, index, Number(options.offset ?? 0), Number(options.limit ?? 25)),
+  return { catalogFile: path.join(workspace, "media-catalog.jsonl"), overviewFile: await saveOverview(workspace, index, Number(options.offset ?? 0), Number(options.limit ?? 25)),
     sourceCount: index.sources.length, audioCount: index.audio.length };
 }
 
@@ -629,9 +965,10 @@ export async function annotateBatch(options, overrides = {}) {
   const prepared = [];
   const seen = new Set();
   for (let rowIndex = 0; rowIndex < manifest.rows.length; rowIndex++) {
-    const row = manifest.rows[rowIndex], kind = row?.kind || "source";
+    const row = manifest.rows[rowIndex];
     try {
-      const indexed = await matchIndexed(all, row.file, kind);
+      const indexed = await matchIndexed(all, row.file, row.kind || (row.id ? undefined : "source"), row.id);
+      const kind = indexed.kind;
       const item = await cacheFile(indexed.source, kind, overrides);
       if (!row.observation && !row.transcript) throw new Error("需要 observation 或 transcript");
       const id = `${kind}:${item.sourceKey}`;
@@ -658,7 +995,8 @@ export async function annotateBatch(options, overrides = {}) {
     if (kind === "reference") index.reference = view;
     else (kind === "audio" ? index.audio : index.sources).splice(
       (kind === "audio" ? index.audio : index.sources).findIndex((entry) => entry.source === view.source), 1, view);
-    saved.push({ source: view.source, entry: view.entry, observationState: view.analysis.observation.state,
+    saved.push({ source: view.source, sourceKey: view.sourceKey, entry: view.entry,
+      ...(observationRecord ? { observationCreatedAt: observationRecord.createdAt } : {}), observationState: view.analysis.observation.state,
       transcriptState: view.analysis.transcript.state });
   }
   await writeTaskJson(workspace, path.join(workspace, "media-index.json"), index);
@@ -743,7 +1081,7 @@ export async function transcribeBatch(options, overrides = {}) {
   for (let rowIndex = 0; rowIndex < manifest.rows.length; rowIndex++) {
     const row = manifest.rows[rowIndex];
     try {
-      const indexed = await matchIndexed(all, row.file, row.kind || "audio");
+      const indexed = await matchIndexed(all, row.file, row.kind || (row.id ? undefined : "audio"), row.id);
       const item = await cacheFile(indexed.source, indexed.kind, context);
       if (!item.audio?.length) throw new Error("没有可转写的音频流");
       const id = `${item.kind}:${item.sourceKey}`;
@@ -807,7 +1145,15 @@ export async function detail(options, overrides = {}) {
   const geometry = displayGeometry(media.stream);
   const maxSide = options.original ? Math.ceil(Math.max(geometry.width, geometry.height)) : 1280;
   const route = await extract(file, at, out, maxSide, context);
-  return { path: out, at, geometry, route };
+  await saveGeneratedView(workspace, file, media.duration, geometry, [{ path: out, at }], [], `${out}.visual.json`);
+  return { path: out, source: file, at, geometry, route, images: await imageProvenance(workspace, [out]) };
+}
+
+async function saveGeneratedView(workspace, source, duration, geometry, frames, sheets, entry) {
+  const access = await mediaAccess(workspace);
+  const kind = source.toLowerCase() === access.reference.toLowerCase() ? "reference" : "source";
+  const sourceKey = (await fingerprint(await access.file(source, kind))).key;
+  await writeTaskJson(workspace, entry, { source, sourceKey, kind, duration, geometry, frames, sheets, entry });
 }
 
 export async function candidateWindow(options, overrides = {}) {
@@ -834,7 +1180,9 @@ export async function candidateWindow(options, overrides = {}) {
   const geometry = displayGeometry(media.stream);
   const sheets = (await createSheets(frames, directory, geometry.aspect, "candidate", context))
     .map((item) => ({ ...item, path: path.join(directory, item.name) }));
-  return { source: file, directory, geometry, frames, sheets };
+  await saveGeneratedView(workspace, file, media.duration, geometry, frames, sheets, path.join(directory, "entry.json"));
+  return { source: file, directory, geometry, frames, sheets,
+    images: await imageProvenance(workspace, sheets.map((sheet) => sheet.path)) };
 }
 
 export async function resheet(options, overrides = {}) {
@@ -856,16 +1204,22 @@ export async function resheet(options, overrides = {}) {
   const sourceId = createHash("sha256").update(item.source).digest("hex").slice(0, 8);
   const sheets = (await createSheets(frames, directory, item.geometry.aspect, sourceId, context, batch, bound))
     .map((entry) => ({ ...entry, path: path.join(directory, entry.name) }));
-  return { source: item.source, cacheHit: item.cacheHit, directory, sheets };
+  await saveGeneratedView(workspace, item.source, item.duration, item.geometry, [], sheets, path.join(directory, "entry.json"));
+  return { source: item.source, cacheHit: item.cacheHit, directory, sheets,
+    images: await imageProvenance(workspace, sheets.map((sheet) => sheet.path)) };
 }
 
 export function checkPlan(plan, allowReuse = false) {
+  if (!plan || typeof plan !== "object" || (plan.outputs !== undefined && !Array.isArray(plan.outputs))) throw new Error("方案 outputs 必须是数组");
   const issues = [];
   const outputs = plan.outputs ?? [];
-  for (const output of outputs) for (const shot of output.shots ?? []) {
-    if (typeof shot.source !== "string" || !shot.source || !Number.isFinite(shot.start)
+  for (const output of outputs) {
+    if (!output || typeof output !== "object" || (output.shots !== undefined && !Array.isArray(output.shots))) throw new Error("方案每行 shots 必须是数组");
+    for (const shot of output.shots ?? []) {
+    if (!shot || typeof shot.source !== "string" || !shot.source || !Number.isFinite(shot.start)
       || !Number.isFinite(shot.end) || shot.start < 0 || shot.end <= shot.start) {
       throw new Error("方案中的镜头必须包含 source 和有效 start/end 秒数");
+    }
     }
   }
   for (let i = 0; i < outputs.length; i++) for (let j = i + 1; j < outputs.length; j++) {
@@ -905,7 +1259,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   try {
     const argv = process.argv.slice(2);
     if ((argv.length === 1 || argv.length === 2) && ["--help", "-h"].includes(argv.at(-1))) {
-      process.stdout.write("media-cache.mjs index|overview|entry|annotate|annotate-batch|transcribe-batch|detail|window|resheet|check-plan [--key value]\n");
+      process.stdout.write("media-cache.mjs index|overview|entry|locate|annotate|annotate-batch|transcribe-batch|detail|window|resheet|check-plan [--key value]\nlocate --workspace <dir> --ids <id,id>; entry --workspace <dir> --id <id> (or --file <media> --kind <kind>)\n");
       process.exit(0);
     }
     const { command, options } = parseArgs(argv);
@@ -913,14 +1267,16 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (command === "index") result = await indexTask(options);
     else if (command === "overview") result = await overview(options);
     else if (command === "entry") result = await entryDetails(options);
+    else if (command === "locate") result = await locate(options);
     else if (command === "annotate") result = await annotate(options);
     else if (command === "annotate-batch") result = await annotateBatch(options);
     else if (command === "transcribe-batch") result = await transcribeBatch(options);
     else if (command === "detail") result = await detail(options);
     else if (command === "window") result = await candidateWindow(options);
     else if (command === "resheet") result = await resheet(options);
-    else if (command === "check-plan") result = checkPlan(JSON.parse(await fs.readFile(options.file, "utf8")), options["allow-reuse"]);
-    else throw new Error("用法：media-cache.mjs index|overview|entry|annotate|annotate-batch|transcribe-batch|detail|window|resheet|check-plan [--key value]");
+    else if (command === "check-plan") result = options.workspace ? await checkTaskPlan(options)
+      : checkPlan(JSON.parse(await fs.readFile(options.file, "utf8")), options["allow-reuse"]);
+    else throw new Error("用法：media-cache.mjs index|overview|entry|locate|annotate|annotate-batch|transcribe-batch|detail|window|resheet|check-plan [--key value]");
     process.stdout.write(`${JSON.stringify(result)}${os.EOL}`);
   } catch (error) {
     process.stderr.write(`media-cache: ${error.message}${os.EOL}`);

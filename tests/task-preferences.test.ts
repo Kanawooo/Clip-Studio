@@ -198,6 +198,7 @@ for (const choice of [undefined, false, true]) {
       assert.deepEqual(policy, { version: 1, taskId: options.taskId, reuseVisualAnalysis: normalized,
         inputs: { referenceVideo: value.input.referenceVideo, assetsDir: value.input.assetsDir, audioDir: value.input.audioDir } });
       assert.equal(input.reuseVisualAnalysis, normalized);
+      assert.equal(options.newTask, policies.length === 0, "only creation bootstraps a new native mode; same-task retry is not reclassified");
       policies.push(policy);
     });
     const task = await runner.manager.createTask({ ...value.input,

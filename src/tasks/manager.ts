@@ -33,6 +33,8 @@ export interface SessionStartOptions {
   taskDir: string;
   sessionDir: string;
   resumeSessionFile?: string;
+  /** Internal bootstrap only; never a task/API/prompt field. */
+  newTask?: boolean;
 }
 
 export type SessionFactory = (
@@ -102,6 +104,7 @@ export class TaskManager {
         outputDir: input.outputDir,
         sessionDir: start.sessionDir,
         model: input.model,
+        newTask: start.newTask,
       };
       let pi;
       let restoredSession = false;
@@ -110,7 +113,7 @@ export class TaskManager {
           pi = await createPiVideoSession({ ...sessionOptions, resumeSessionFile: start.resumeSessionFile });
           restoredSession = true;
         }
-        catch { pi = await createPiVideoSession(sessionOptions); }
+        catch { pi = await createPiVideoSession({ ...sessionOptions, batchRequirementSessionFile: start.resumeSessionFile }); }
       } else pi = await createPiVideoSession(sessionOptions);
       let lastToolFailure: string | undefined;
       const unsubscribe = pi.session.subscribe((event) => {
@@ -399,6 +402,7 @@ export class TaskManager {
     });
     runtime.session = await this.sessionFactory(input, runtime.workspace, {
       taskId: runtime.task.id, taskDir: runtime.taskDir, sessionDir: runtime.sessionDir, resumeSessionFile,
+      newTask: typeof prompt === "string" && !runtime.task.startedAt,
     });
     if (!isActive(runtime.task.status)) {
       await runtime.session.dispose();

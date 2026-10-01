@@ -1,19 +1,162 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
-import type { InlineExtension, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, InlineExtension, SessionManager, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import {
   effectivePath, pathInside, resolveTaskPaths, sameFilePath,
   type TaskPathOptions, type TaskPaths,
 } from "./task-paths.js";
+import { createVisualRuntime } from "./visual-context.js";
 
 export interface TaskAccessPolicyOptions extends TaskPathOptions {
   onTermination?: (reason: string) => void;
 }
 
+const BATCH_MARKER = "clip-composition-batch";
+interface CompositionReceipt { toolCallId: string; kind: "writer" | "edit"; files: Array<{ file: string; sha256: string }> }
+
+/** Native custom entries never participate in the model context. Legacy Sessions stay unmarked. */
+export function initializeCompositionBatch(manager: SessionManager, workspace: string, newTask: boolean, recoveryFile?: string): void {
+  if (manager.getEntries().some((entry) => entry.type === "custom" && entry.customType === BATCH_MARKER)) return;
+  if (!newTask && !recoveryFile) return;
+  const contract = JSON.parse(readFileSync(path.join(workspace, "..", "delivery", "contract.json"), "utf8"));
+  let recover = false;
+  if (recoveryFile && pathInside(manager.getSessionDir(), effectivePath(recoveryFile))) {
+    // A failed normal open can still recover this small trusted native marker.
+    recover = readFileSync(recoveryFile, "utf8").split(/\r?\n/).some((line) => {
+      try { const entry = JSON.parse(line); return entry.type === "custom" && entry.customType === BATCH_MARKER
+        && entry.data?.version === 1 && entry.data.taskId === contract.taskId && entry.data.required === true; }
+      catch { return false; }
+    });
+  }
+  if ((newTask || recover) && contract.version === 1 && sameFilePath(contract.workspace, workspace)
+    && Array.isArray(contract.slots) && contract.slots.length > 1)
+    manager.appendCustomEntry(BATCH_MARKER, { version: 1, taskId: contract.taskId, required: true, count: contract.slots.length });
+}
+
+/** Production-contract correction, independent of access-denial counters. */
+export function createCompositionBatchGuard(options: TaskAccessPolicyOptions) {
+  const workspace = effectivePath(options.workspace);
+  const writer = path.join(options.projectRoot, ".pi/skills/hyperframes/hyperframes-cli/scripts/write-compositions.mjs");
+  const queue = path.join(options.projectRoot, ".pi/skills/hyperframes/hyperframes-cli/scripts/render-queue.mjs");
+  let repeated: { signature: string; count: number } | undefined;
+  const digest = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
+  function calls(command: unknown, script: string, action?: string) {
+    const tokens = typeof command === "string" ? tokenize(command) : undefined;
+    if (!tokens) return [];
+    const clauses: Token[][] = [[]];
+    for (const token of tokens) { if (token.value === "&&" && token.kind === "operator") clauses.push([]); else clauses.at(-1)!.push(token); }
+    let cwd = workspace;
+    const found: Array<{ manifest: string; cwd: string }> = [];
+    for (const clause of clauses) {
+      const words = parseSegment(clause)?.words;
+      if (!words?.length) continue;
+      if (words[0] === "cd" && words.length === 2) { cwd = path.resolve(cwd, words[1]!); continue; }
+      if (executable(words[0]!) !== "node" || !words[1] || !path.isAbsolute(words[1]) || !sameFilePath(words[1], script)
+        || (action && words[2] !== action)) continue;
+      const args = words.slice(action ? 3 : 2), manifest = flagValue(args, "--manifest");
+      if (manifest) found.push({ manifest: path.resolve(cwd, manifest), cwd });
+    }
+    return found;
+  }
+  function writerResult(event: Pick<ToolResultEvent, "content">): Array<{ file: string; sha256: string }> {
+    for (const line of event.content.filter((block) => block.type === "text").flatMap((block) => block.text.split(/\r?\n/))) {
+      try {
+        const value = JSON.parse(line);
+        if (![value.saved, value.skipped, value.failed].every(Array.isArray)) continue;
+        return [...value.saved, ...value.skipped].filter((row) => typeof row.file === "string"
+          && /^[a-f0-9]{64}$/.test(row.sha256 ?? ""));
+      } catch { /* The native Bash error tail can accompany a partial-success JSON. */ }
+    }
+    return [];
+  }
+  function history(ctx: ExtensionContext) {
+    const entries = ctx.sessionManager.getBranch();
+    const messages = entries.filter((entry) => entry.type === "message").map((entry) => entry.message);
+    const tools = new Map<string, { name: string; arguments: Record<string, unknown> }>();
+    const results = new Map<string, Extract<(typeof messages)[number], { role: "toolResult" }>>();
+    for (const message of messages) {
+      if (message.role === "assistant" && !["error", "aborted"].includes(message.stopReason))
+        for (const block of message.content) if (block.type === "toolCall") tools.set(block.id, block);
+      if (message.role === "toolResult") results.set(message.toolCallId, message);
+    }
+    const proven = new Map<string, string>();
+    for (const entry of entries) {
+      if (entry.type !== "custom" || entry.customType !== "clip-composition-receipt") continue;
+      const receipt = entry.data as CompositionReceipt | undefined;
+      if (!receipt || !Array.isArray(receipt.files)) continue;
+      const call = tools.get(receipt.toolCallId), result = results.get(receipt.toolCallId);
+      if (!call || !result) continue;
+      if (receipt.kind === "writer" && call.name === "bash" && calls(call.arguments.command, writer).length) {
+        const returned = writerResult(result);
+        for (const item of receipt.files) if (returned.some((row) => sameFilePath(row.file, item.file) && row.sha256 === item.sha256))
+          proven.set(effectivePath(item.file), item.sha256);
+      } else if (receipt.kind === "edit" && !result.isError && ["edit", "write"].includes(call.name)
+        && typeof call.arguments.path === "string") {
+        const target = effectivePath(path.resolve(workspace, call.arguments.path));
+        for (const item of receipt.files) if (sameFilePath(item.file, target) && proven.has(target)) proven.set(target, item.sha256);
+      }
+    }
+    return { entries, proven };
+  }
+  function before(event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {
+    if (event.toolName !== "bash") return;
+    const runs = calls(event.input.command, queue, "run");
+    if (!runs.length) return;
+    const { entries, proven } = history(ctx);
+    const policy = JSON.parse(readFileSync(path.join(workspace, "media-policy.json"), "utf8"));
+    const marker = entries.find((entry) => entry.type === "custom" && entry.customType === BATCH_MARKER
+      && (entry.data as { version?: number; taskId?: string; required?: boolean })?.version === 1
+      && (entry.data as { taskId?: string })?.taskId === policy.taskId && (entry.data as { required?: boolean })?.required === true);
+    if (!marker || marker.type !== "custom") return;
+    const requiredCount = (marker.data as { count?: number }).count;
+    for (const run of runs) {
+      let parsed;
+      try { parsed = JSON.parse(readFileSync(run.manifest, "utf8")); } catch { continue; }
+      // Malformed queue fields belong to the existing queue's precise field validator.
+      if (typeof parsed?.project !== "string" || !Array.isArray(parsed.rows) || parsed.rows.length < 2
+        || (requiredCount !== undefined && parsed.rows.length !== requiredCount)) continue;
+      const project = path.resolve(workspace, parsed.project);
+      if (!pathInside(workspace, project) || parsed.rows.some((row: { composition?: unknown }) => typeof row?.composition !== "string")) continue;
+      const targets: string[] = parsed.rows.map((row: { composition: string }) => effectivePath(path.resolve(project, row.composition)));
+      if (targets.some((file) => !pathInside(workspace, file))) continue;
+      const missing = targets.filter((file) => { try { return proven.get(file) !== digest(file); } catch { return true; } });
+      if (!missing.length) { repeated = undefined; continue; }
+      const signature = JSON.stringify([missing, [...proven]]);
+      repeated = repeated?.signature === signature ? { signature, count: repeated.count + 1 } : { signature, count: 1 };
+      const reason = `[VALIDATION:COMPOSITION_BATCH_REQUIRED] rows.composition：缺少可信批量写入记录：${missing.map((file) => path.relative(workspace, file)).join("、")}。保存工程清单 {version:1,project,rows:[{composition,content 或 template/values,mainAudio}]}，调用 node "${writer}" --workspace "${workspace}" --manifest "${path.join(workspace, "composition-batch.json")}"；可分批及补单行，相同工程可幂等接入，随后保留当前渲染清单重试。局部修改用原生 edit。`;
+      if (repeated.count >= 3) options.onTermination?.(`制作失败：${reason} 同一流程错误重复 3 次，已停止；已有工程和成片保留。`);
+      return { block: true, reason, terminate: repeated.count >= 3 };
+    }
+  }
+  function after(event: ToolResultEvent, ctx: ExtensionContext, append: (data: CompositionReceipt) => void) {
+    if (event.toolName === "bash" && calls(event.input.command, writer).length) {
+      const expected = new Set<string>();
+      for (const call of calls(event.input.command, writer)) {
+        try {
+          const manifest = JSON.parse(readFileSync(call.manifest, "utf8"));
+          if (typeof manifest.project !== "string" || !Array.isArray(manifest.rows)) continue;
+          for (const row of manifest.rows) if (typeof row?.composition === "string")
+            expected.add(effectivePath(path.resolve(workspace, manifest.project, row.composition)));
+        } catch { /* A failed preflight creates no proven composition. */ }
+      }
+      const files = writerResult(event).filter((item) => {
+        try { const file = effectivePath(item.file); return pathInside(workspace, file) && expected.has(file) && digest(file) === item.sha256; }
+        catch { return false; }
+      });
+      if (files.length) { append({ kind: "writer", toolCallId: event.toolCallId, files }); repeated = undefined; }
+    } else if (!event.isError && ["write", "edit"].includes(event.toolName) && typeof event.input.path === "string") {
+      const file = effectivePath(path.resolve(workspace, event.input.path));
+      if (history(ctx).proven.has(file)) append({ kind: "edit", toolCallId: event.toolCallId, files: [{ file, sha256: digest(file) }] });
+    }
+  }
+  return { before, after };
+}
+
 interface Boundary extends TaskPaths {
   mediaCacheScript: string;
   renderQueueScript: string;
+  compositionScript: string;
   hyperframesScript: string;
   audioDataScript: string;
   mediaPolicy: string;
@@ -33,21 +176,30 @@ const MUTATION_COMMANDS = new Set(["mkdir", "md", "touch", "rm", "del", "erase",
 const OUTPUT_FLAGS = new Set(["-o", "--out", "--output", "--out-dir", "--output-dir", "--dest", "--destination"]);
 const MEDIA_EXTENSIONS = /\.(?:mp4|mov|mkv|webm|avi|m4v|mp3|m4a|wav|aac|flac|ogg|srt|vtt|json|jpg|jpeg|png|webp|cube|txt|html)$/i;
 const SKILL_READ_EXTENSIONS = new Set([".md", ".txt", ".html", ".css", ".svg", ".png", ".jpg", ".jpeg", ".webp"]);
-const SINGLE_USE_FLAGS = new Set(["--workspace", "--output-dir", "--manifest", "--reference", "--assets", "--audio", "--file", "--text-file", "--textFile", "--project", "--dir", "-d", "--output", "-o", "--out"]);
+const SINGLE_USE_FLAGS = new Set(["--workspace", "--output-dir", "--manifest", "--reference", "--assets", "--audio", "--file", "--id", "--ids", "--text-file", "--textFile", "--project", "--dir", "-d", "--output", "-o", "--out"]);
 const ALIAS_GROUPS = [["--project", "--dir", "-d"], ["--output", "--out", "-o"], ["--text-file", "--textFile"]];
 
 export function createTaskAccessPolicy(options: TaskAccessPolicyOptions): InlineExtension {
   const handler = createTaskAccessHandler(options);
   const failure = createRenderFailureHandler(options);
+  const visual = createVisualRuntime(options);
+  const batch = createCompositionBatchGuard(options);
   return { name: "task-access-policy", hidden: true, factory: (pi) => {
-    pi.on("tool_call", (event) => {
+    pi.on("context", visual.context);
+    pi.on("context_with_system", visual.contextWithSystem);
+    pi.on("session_before_compact", visual.beforeCompact);
+    pi.on("before_provider_request", visual.providerRequest);
+    pi.on("tool_call", (event, context) => {
       const result = handler(event);
-      if (!result) failure.before(event);
-      return result;
+      if (result) return result;
+      failure.before(event);
+      return batch.before(event, context);
     });
-    pi.on("tool_result", (event, context) => {
+    pi.on("tool_result", async (event, context) => {
+      batch.after(event, context, (data) => pi.appendEntry("clip-composition-receipt", data));
       const reason = failure.after(event);
       if (reason) { options.onTermination?.(reason); context.abort(); }
+      else return (await visual.selectionResult(event, context)) ?? visual.toolResult(event, context);
     });
   } };
 }
@@ -59,6 +211,7 @@ export function createTaskAccessHandler(options: TaskAccessPolicyOptions): (even
     ...paths,
     mediaCacheScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs")),
     renderQueueScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "render-queue.mjs")),
+    compositionScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-cli", "scripts", "write-compositions.mjs")),
     hyperframesScript: effectivePath(path.join(paths.projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs")),
     audioDataScript: effectivePath(path.join(paths.projectRoot, ".pi", "skills", "hyperframes", "hyperframes-creative", "scripts", "extract-audio-data.py")),
     mediaPolicy: path.join(paths.workspace, "media-policy.json"),
@@ -200,7 +353,7 @@ function inspectSegment(segment: Segment, cwd: string, boundary: Boundary): stri
   if (ALIAS_GROUPS.some((group) => group.filter((flag) => seenFlags.has(flag)).length > 1)) return COMMAND_BLOCK;
   const name = executable(program);
   const publicHelp = ["node", "hyperframes", "npx"].includes(name)
-    && (helpOnly(args) || helpOnly(args.slice(1)) || (name === "node" && helpOnly(args.slice(2))));
+    && (queryOnly(args) || queryOnly(args.slice(1)) || (name === "node" && helpOnly(args.slice(2))));
   if (!pathInside(boundary.workspace, cwd) && !READ_COMMANDS.has(name) && name !== "ffprobe" && !publicHelp) {
     return "当前目录是只读媒体目录。请切回任务工作目录运行 FFmpeg 或本地技能 CLI，并传入媒体绝对路径。";
   }
@@ -285,6 +438,14 @@ function inspectNode(args: string[], cwd: string, boundary: Boundary, skipSkillC
   if (skipSkillChecks && !sameFilePath(actual, boundary.hyperframesScript)) return COMMAND_BLOCK;
   if (sameFilePath(actual, boundary.mediaCacheScript)) return helpOnly([action, ...rest]) ? undefined : inspectMediaCache(action, rest, cwd, boundary);
   if (sameFilePath(actual, boundary.renderQueueScript)) return helpOnly([action, ...rest]) ? undefined : inspectRenderQueue(action, rest, cwd, boundary);
+  if (sameFilePath(actual, boundary.compositionScript)) {
+    if (helpOnly([action, ...rest])) return undefined;
+    const values = [action, ...rest];
+    if (!validValueFlags(values, ["--workspace", "--manifest"])) return COMMAND_BLOCK;
+    const workspace = flagValue(values, "--workspace"), manifest = flagValue(values, "--manifest");
+    if (!workspace || !sameFilePath(path.resolve(cwd, workspace), boundary.workspace)) return WRITE_BLOCK;
+    return manifest && pathInside(boundary.workspace, path.resolve(cwd, manifest)) ? undefined : READ_BLOCK;
+  }
   if (sameFilePath(actual, boundary.hyperframesScript)) return inspectHyperframes([action, ...rest], cwd, boundary, skipSkillChecks);
   return COMMAND_BLOCK;
 }
@@ -298,11 +459,20 @@ function inspectPython(args: string[], cwd: string, boundary: Boundary): string 
 }
 
 function inspectMediaCache(action: string, args: string[], cwd: string, boundary: Boundary): string | undefined {
-  if (!["index", "overview", "entry", "annotate", "annotate-batch", "transcribe-batch", "detail", "window", "resheet", "check-plan"].includes(action)) return COMMAND_BLOCK;
+  if (!["index", "overview", "entry", "locate", "annotate", "annotate-batch", "transcribe-batch", "detail", "window", "resheet", "check-plan"].includes(action)) return COMMAND_BLOCK;
   if (helpOnly(args)) return undefined;
-  if (["overview", "entry", "annotate-batch", "transcribe-batch"].includes(action)) {
+  if (action === "check-plan") {
+    const allowed = args.filter((arg) => arg !== "--allow-reuse");
+    if (args.filter((arg) => arg === "--allow-reuse").length > 1
+      || !validValueFlags(allowed, ["--file", "--workspace"])) return COMMAND_BLOCK;
+    const workspace = flagValue(args, "--workspace"), file = flagValue(args, "--file");
+    if (workspace && !sameFilePath(effectivePath(path.resolve(cwd, workspace)), boundary.workspace)) return WRITE_BLOCK;
+    return file && pathInside(boundary.workspace, effectivePath(path.resolve(cwd, file))) ? undefined : READ_BLOCK;
+  }
+  if (["overview", "entry", "locate", "annotate-batch", "transcribe-batch"].includes(action)) {
     const allowed = action === "overview" ? ["--workspace", "--offset", "--limit"]
-      : action === "entry" ? ["--workspace", "--file", "--kind"]
+      : action === "entry" ? ["--workspace", "--file", "--id", "--kind"]
+        : action === "locate" ? ["--workspace", "--ids"]
         : action === "transcribe-batch" ? ["--workspace", "--manifest", "--language", "--model"]
           : ["--workspace", "--manifest"];
     if (!validValueFlags(args, allowed)) return COMMAND_BLOCK;
@@ -314,9 +484,13 @@ function inspectMediaCache(action: string, args: string[], cwd: string, boundary
         || (limit !== undefined && (!/^\d+$/.test(limit) || Number(limit) < 1 || Number(limit) > 100)) ? COMMAND_BLOCK : undefined;
     }
     if (action === "entry") {
-      const file = flagValue(args, "--file"), kind = flagValue(args, "--kind");
+      const file = flagValue(args, "--file"), kind = flagValue(args, "--kind"), id = flagValue(args, "--id");
+      if (id) return !file && /^(ref|src|aud)-[a-f0-9]{12,64}$/.test(id)
+        && (!kind || ["reference", "source", "audio"].includes(kind)) ? undefined : COMMAND_BLOCK;
       return file && readable(file, cwd, boundary) && ["reference", "source", "audio"].includes(kind ?? "") ? undefined : READ_BLOCK;
     }
+    if (action === "locate") return flagValue(args, "--ids")?.split(",")
+      .every((id) => /^(ref|src|aud)-[a-f0-9]{12,64}$/.test(id)) ? undefined : COMMAND_BLOCK;
     const manifest = flagValue(args, "--manifest");
     return manifest && pathInside(boundary.workspace, effectivePath(path.resolve(cwd, manifest))) ? undefined : READ_BLOCK;
   }
@@ -364,7 +538,7 @@ function inspectHyperframes(args: string[], cwd: string, boundary: Boundary, off
   const [action, ...rest] = args;
   // Public help does not read media or create a project. Never treat --help
   // with additional positional/path arguments as this read-only form.
-  if (helpOnly(args) || (action && (HYPERFRAMES_COMMANDS.has(action) || ["init", "render"].includes(action)) && helpOnly(rest))) return undefined;
+  if (queryOnly(args) || (action && (HYPERFRAMES_COMMANDS.has(action) || ["init", "render"].includes(action)) && helpOnly(rest))) return undefined;
   if (action === "init") {
     const command = `HYPERFRAMES_SKIP_SKILLS=1 node "${boundary.hyperframesScript.replace(/\\/g, "/")}" init video-project --non-interactive --example blank`;
     if (!offlineInit) return `本地离线初始化请使用：${command}。不要执行技能更新。`;
@@ -610,6 +784,9 @@ function flagValue(args: string[], flag: string): string | undefined {
 }
 
 function helpOnly(args: string[]): boolean { return args.length === 1 && ["--help", "-h"].includes(args[0]!); }
+function queryOnly(args: string[]): boolean {
+  return helpOnly(args) || (args.length === 1 && ["--version", "-V"].includes(args[0]!));
+}
 
 function validValueFlags(args: string[], allowed: string[]): boolean {
   const seen = new Set<string>();

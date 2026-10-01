@@ -57,7 +57,7 @@ function inside(root, candidate) {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function publicError(value) {
+export function publicError(value) {
   return String(value)
     .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, "***")
     .replace(/\b(Authorization\s*:\s*)(?:Bearer\s+)?[^\s,;"']+/gi, "$1***")
@@ -93,9 +93,15 @@ async function mediaInfo(file) {
   return JSON.parse(await runCapture(ffprobe, ["-v", "error", "-show_streams", "-show_format", "-of", "json", file]));
 }
 
-function attribute(tag, name) {
+export function attribute(tag, name) {
   const quoted = tag.match(new RegExp(`(?:\\s|^)${name}\\s*=\\s*(["'])(.*?)\\1`, "i"));
-  return quoted?.[2] ?? tag.match(new RegExp(`(?:\\s|^)${name}\\s*=\\s*([^\\s>]+)`, "i"))?.[1];
+  const value = quoted?.[2] ?? tag.match(new RegExp(`(?:\\s|^)${name}\\s*=\\s*([^\\s>]+)`, "i"))?.[1];
+  return value?.replace(/&(?:amp|quot|apos|lt|gt|#\d+|#x[\da-f]+);/gi, (entity) => {
+    const named = { "&amp;": "&", "&quot;": '"', "&apos;": "'", "&lt;": "<", "&gt;": ">" }[entity.toLowerCase()];
+    if (named !== undefined) return named;
+    const number = entity.toLowerCase().startsWith("&#x") ? parseInt(entity.slice(3, -1), 16) : Number(entity.slice(2, -1));
+    return number > 0 && number <= 0x10ffff ? String.fromCodePoint(number) : entity;
+  });
 }
 
 function close(left, right, tolerance = 0.12) { return Math.abs(left - right) <= tolerance; }
@@ -105,8 +111,8 @@ async function sourceIdentity(file) {
   return { path: file, size: stat.size, mtimeMs: stat.mtimeMs, sha256: await sha256(file) };
 }
 
-async function validateAudio(row, composition, project, contract, fps) {
-  const html = await fs.readFile(composition, "utf8");
+export async function validateAudio(row, composition, project, contract, fps, suppliedHtml) {
+  const html = suppliedHtml ?? await fs.readFile(composition, "utf8");
   const rootTag = html.match(/<[a-z][^>]*\bdata-composition-id\s*=\s*(?:["'][^"']+["']|[^\s>]+)[^>]*>/i)?.[0];
   const rootValue = rootTag && attribute(rootTag, "data-duration");
   const rootDuration = rootValue === undefined ? undefined : Number(rootValue);
@@ -114,7 +120,15 @@ async function validateAudio(row, composition, project, contract, fps) {
     throw new Error("工程根必须显式设置有效的 data-duration");
   }
   const audioTags = [...html.matchAll(/<audio\b[^>]*>/gi)].map((match) => match[0]);
-  const inputs = [await sourceIdentity(composition)];
+  const resolvedAudio = await Promise.all(audioTags.map(async (tag) => {
+    const src = attribute(tag, "src");
+    if (!src || /^(?:https?|data|blob):/i.test(src) || /\bmuted\b/i.test(tag)) return { tag, source: null };
+    try {
+      const candidate = src.startsWith("file://") ? fileURLToPath(src) : path.resolve(project, src);
+      return { tag, source: await fs.realpath(candidate) };
+    } catch { return { tag, source: null }; }
+  }));
+  const inputs = suppliedHtml === undefined ? [await sourceIdentity(composition)] : [];
   if (row.silentDuration !== undefined) {
     if (!(Number(contract.silentDuration) > 0) || !close(Number(row.silentDuration), Number(contract.silentDuration))) {
       throw new Error("无声成片必须在剪辑要求中明确写出无声和时长");
@@ -148,12 +162,8 @@ async function validateAudio(row, composition, project, contract, fps) {
     }
     const length = (to - from) / rate;
     if (!close(at, timelineEnd)) throw new Error(`主音频第 ${index + 1} 段未连续接上前一段`);
-    const matched = audioTags.some((tag) => {
-      const src = attribute(tag, "src");
-      if (!src || /^(?:https?|data|blob):/i.test(src) || /\bmuted\b/i.test(tag)) return false;
-      let actual;
-      try { actual = src.startsWith("file://") ? fileURLToPath(src) : path.resolve(project, src); }
-      catch { return false; }
+    const matched = resolvedAudio.some(({ tag, source: actual }) => {
+      if (!actual) return false;
       const tagDurationValue = attribute(tag, "data-duration");
       const tagDuration = tagDurationValue === undefined ? (duration - from) / rate : Number(tagDurationValue);
       return same(actual, source) && close(Number(attribute(tag, "data-start")), at)

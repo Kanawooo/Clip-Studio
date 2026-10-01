@@ -9,17 +9,37 @@ description: 面向 AI Agent 的视频剪辑技能套件，把各大剪辑博主
 
 在 Clip Studio 视频任务中，先用 `node <任务提示提供的素材索引脚本绝对路径> index --reference <参考视频> --assets <素材目录> --audio <音频目录> --workspace <当前任务工作目录>` 建立素材索引。任务 Session 的当前目录是工作目录，脚本使用任务提示给出的绝对入口。参考片每秒取样，长素材默认每三秒取样，短素材更密；参考节奏和本次选材由你判断。
 
-先读取命令返回的 `overviewFile`。它列出源文件、时长、宫格路径和分析状态；更多素材用 `overview --workspace <工作目录> --offset 25 --limit 25` 分页查看，候选详情用 `entry --file <视频> --kind source --workspace <工作目录>`。完整 `media-index.json` 供 CLI 维护，概览无需展开每张高清帧的路径。独立的原生工具调用可同轮提交，已完成信息在本 Session 内供所有成片和续作使用。
+先读取命令返回的 `catalogFile`（`media-catalog.jsonl`），每行是准确素材标识、文件名、时长、画面比例、宫格页数和分析状态。用 `locate --workspace <工作目录> --ids <逗号分隔的准确标识>` 一次取得源路径及图片来源标识、页码、时间范围、尺寸和字节。按返回的 `imageGroups` 读取：默认新增最多 4 张图，容量更严时减到 3、2 或 1 张；一条 assistant 回复同时发出本组多个原生 `read`，下一次请求一起看这些真实图片，不逐图等待一轮模型。参考页、素材页、局部单帧均计入新增数量；独立文本读取不受四图限制。本 Session 内已看范围用于后续成片和续作，不重新扫描整库。
+
+四张是本轮新增数，不是完整历史总图数。`grouping` 计入保留的历史图片及请求负担；客户端估算不代表上游最大容量。`deferredImages` 先暂缓：完成当前参考/候选比较、明确取舍后再定位后续组，保持未确定候选和必要参考真实图像。每页只属于定位结果中指定的视频与时间范围，不能跨视频混用时间戳。内容、细节、动作或切点不清楚时优先 `read` 该详情的匹配高清 `frames`；不足时从源视频执行 `detail`/`window`，不是放大宫格。独立复看点也按容量同轮读取。
+
+`overviewFile` 与 `overview --workspace <工作目录> --offset 25 --limit 25` 仍供分页查看；候选完整详情用 `entry --id <素材标识> --workspace <工作目录>`，也支持原有 `entry --file <视频> --kind source --workspace <工作目录>`。完整 `media-index.json` 由 CLI 维护。标识来自当前目录，源文件变化后重新 `index` 获得新标识；`locate` 只查已生成的图片与元信息。剪辑方案中的 source 使用定位结果的准确路径。
 
 `cacheHit` 表示基础媒体文件身份未变。FFprobe、高清帧、宫格和匹配配置的转写继续复用。`workspace/media-policy.json` 是任务的只读配置：默认关闭跨任务 AI 画面分析复用，新任务仍独立看缓存图片；开启时，中立描述帮助找候选，选用画面仍读取对应宫格或局部图。参考判断每个任务重做，同任务观察可继续使用。`absent/partial/incompatible` 表示分析缺失、不完整或失效；文字覆盖范围之外的素材需要看图补充判断。
 
 概览是最长边 2000 以内的 JPEG，按实际显示比例、旋转及像素宽高比自动布局和拆页。候选细节用 `detail --file <视频> --at <秒> --workspace <工作目录> --output <工作目录中的图片>`，`--original` 输出原始长边；连续候选用 `window --file <视频> --start <秒> --end <秒> --workspace <工作目录>` 每秒检查局部区间。`resheet --file <视频> --kind source --workspace <工作目录> --batch-size 9 --max-sheet 2000` 从已有帧重组较小宫格。
 
-已有中立画面观察与实际转写一次批量保存：在工作目录写 `{"version":1,"rows":[{"file":"源文件绝对路径","kind":"source","observation":{"text":"已看到的内容","coverage":[[0,3]],"complete":false}}]}`，用 `annotate-batch --workspace <工作目录> --manifest <该 JSON>`。音频行可填写 `kind:"audio"` 和 `transcript`。`complete:true` 需要 coverage 覆盖整段媒体；局部观察保持 partial。缓存记录只保存源内容、时间区间和转写。单条已有文字可用 `annotate --file <媒体> --kind source --text-file <工作目录中的 UTF-8 文本>`，转写加 `--transcript`。
+已有中立观察与实际转写可一次批量保存：在工作目录写 `{"version":1,"rows":[{"id":"<目录中的准确素材标识>","observation":{"text":"已看到的内容","coverage":[[0,3]],"complete":false}}]}`，用 `annotate-batch --workspace <工作目录> --manifest <该 JSON>`；也支持 file/kind，音频行可写 transcript。`complete:true` 需要覆盖整段媒体，局部观察保持 partial。观察用于追溯和用户开启的跨任务复用；保存文字不会撤掉选镜期间的真实图片，无需每批长篇笔记。单条已有文字可用 `annotate --file <媒体> --kind source --text-file <工作目录中的 UTF-8 文本>`，转写加 `--transcript`。
 
-需要转写的独立音频可统一写为 `{"version":1,"rows":[{"file":"音频绝对路径","kind":"audio"}]}`，用 `transcribe-batch --workspace <工作目录> --manifest <清单 JSON>`，按本机 CPU/可用内存并行并自动保存结果；使用已安装的 Whisper 与模型，默认 small.en。可通过 `--model`、`--language` 选择本机已有的配置，相同源文件及配置才复用完整转写。纯音乐无需语音转写。
+需要转写的独立音频可统一写为 `{"version":1,"rows":[{"id":"<目录中的准确音频标识>"}]}`（也支持 `file` 与 `kind:"audio"`），用 `transcribe-batch --workspace <工作目录> --manifest <清单 JSON>`，按本机 CPU/可用内存并行并自动保存结果；使用已安装的 Whisper 与模型，默认 small.en。可通过 `--model`、`--language` 选择本机已有的配置，相同源文件及配置才复用完整转写。纯音乐无需语音转写。
 
 多成片方案可写为 `{"outputs":[{"shots":[{"source":"绝对路径","start":0,"end":5}]}]}`，调用 `check-plan --file <方案 JSON>` 检查重复开场和长片段重叠；素材确实不足时可传 `--allow-reuse`，由你做最终选择。
+
+逐批初筛用下一节的 selection-batch 原生 write，在看图回复保存取舍并读取下一批。已有方案的兼容字段仍可用：`visual:{"version":1,"taskId":"<media-policy 中的本任务编号>","excluded":["<真实看过且明确排除的准确图片路径>"],"active":["<仍比较的准确图片路径>"],"finalized":false}` 配合 `check-plan --workspace <工作目录> --file <方案 JSON>` 校验明确排除项。参考图在选镜期间保留；修改取舍时复看受影响的准确图片。
+
+全部要求成片的选镜和主音频已确定时，同一方案 outputs 每行填写正式 `output` 槽位、`duration`、`mainAudio:{"source":"<索引音频准确路径>"}` 或连续 segments，以及 shots 的准确源区间（可填 at/rate）；镜头覆盖完整音频时间线。然后设置 `visual.finalized:true` 再校验；无需继续比较的图片可在工程/渲染阶段减载，active 中的图保持。只设置布尔值、旧版 check-plan 或保存观察不证明选镜完成；未实际看过所需参考/素材仍保留图片。
+
+### 每批看图后保存取舍
+
+看完一批真实图后，在下一次回复用原生 write 保存 `selections/<批次>.json`，同时可原生 read 已定位的下一批图。格式如下；image 使用 locate 返回的准确页 ID 或图片路径，from/to 使用该页范围：
+
+```json
+{"version":1,"kind":"selection-batch","rows":[{"image":"<准确素材ID>:page-1","decisions":[{"from":0,"to":3,"decision":"selected","purpose":"<候选镜头用途/音画关联>","reason":"<画面判断及问题>"},{"from":3,"to":6,"decision":"discarded","reason":"<淘汰原因>"}]}]}
+```
+
+decisions 按顺序连续覆盖整页；未看清或仍要比较的区间填 `pending`。选中区间和淘汰区间都可保存；整页无 pending 且校验成功后，该图退出后续请求副本。首次同回复 read 的图尚未看到，不能同时宣称完成；保存失败只修该批，实际图仍保留。普通 annotate 描述不代替取舍。程序补足 source、sourceKey、页号和复看路径，不复制长哈希。
+
+这些是可用候选，不是所有成片的最终时间线。按主音频语义和完整时长、参考风格及差异化规则编排；需要重比构图/颜色/动作时 read 记录中的准确原图，切点不清用 detail/window。再次 read 会恢复实际图片，不以文字代替必要复看。参考图在比较期间保留，全部方案完整 check-plan 后再减载；取样密度、图像像素和正式交付规则保持。
 
 Clip Studio 的 Pi 任务始终在本 Session 内完成，不派生软件子 Agent。
 
