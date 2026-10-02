@@ -7,6 +7,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readOutput } from "./output-io.mjs";
+
+const readPath = (file) => readOutput("交付路径/realpath", file, () => fs.realpath(file));
+const readStat = (file) => readOutput("交付文件/stat", file, () => fs.stat(file));
+const readLinkStat = (file) => readOutput("交付文件/lstat", file, () => fs.lstat(file));
+const readText = (file) => readOutput("交付文件/read", file, () => fs.readFile(file, "utf8"));
+function absentPath(error) {
+  if (error.code === "ENOENT") return null;
+  throw error;
+}
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../..");
 const hyperframesCli = path.join(projectRoot, "node_modules", "hyperframes", "bin", "hyperframes.mjs");
@@ -30,12 +40,12 @@ function invalid(code, field, message, correction = "请修正该字段后调用
 
 async function existingFieldPath(candidate, root, field, type) {
   let actual;
-  try { actual = await fs.realpath(candidate); }
+  try { actual = await readPath(candidate); }
   catch (error) {
     if (error.code !== "ENOENT") throw error;
     invalid("PATH_MISSING", field, `路径不存在：${candidate}`, `请先在任务工作目录准备对应${type === "directory" ? "工程目录" : "文件"}，然后填写相对路径。`);
   }
-  if (!inside(root, actual) || (type === "directory" ? !(await fs.stat(actual)).isDirectory() : !(await fs.stat(actual)).isFile())) {
+  if (!inside(root, actual) || (type === "directory" ? !(await readStat(actual)).isDirectory() : !(await readStat(actual)).isFile())) {
     invalid("PATH_ROLE", field, "路径越界或文件类型不符", "工程和 composition 必须位于当前任务工作目录内，不能指向程序实现或其他任务。");
   }
   return actual;
@@ -79,9 +89,11 @@ async function runCapture(command, args, maxBytes = 2_000_000) {
 }
 
 async function sha256(file) {
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(file)) hash.update(chunk);
-  return hash.digest("hex");
+  return readOutput("成片或输入/hash", file, async () => {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(file)) hash.update(chunk);
+    return hash.digest("hex");
+  });
 }
 
 function same(left, right) {
@@ -107,12 +119,12 @@ export function attribute(tag, name) {
 function close(left, right, tolerance = 0.12) { return Math.abs(left - right) <= tolerance; }
 
 async function sourceIdentity(file) {
-  const stat = await fs.stat(file);
+  const stat = await readStat(file);
   return { path: file, size: stat.size, mtimeMs: stat.mtimeMs, sha256: await sha256(file) };
 }
 
 export async function validateAudio(row, composition, project, contract, fps, suppliedHtml) {
-  const html = suppliedHtml ?? await fs.readFile(composition, "utf8");
+  const html = suppliedHtml ?? await readText(composition);
   const rootTag = html.match(/<[a-z][^>]*\bdata-composition-id\s*=\s*(?:["'][^"']+["']|[^\s>]+)[^>]*>/i)?.[0];
   const rootValue = rootTag && attribute(rootTag, "data-duration");
   const rootDuration = rootValue === undefined ? undefined : Number(rootValue);
@@ -125,8 +137,11 @@ export async function validateAudio(row, composition, project, contract, fps, su
     if (!src || /^(?:https?|data|blob):/i.test(src) || /\bmuted\b/i.test(tag)) return { tag, source: null };
     try {
       const candidate = src.startsWith("file://") ? fileURLToPath(src) : path.resolve(project, src);
-      return { tag, source: await fs.realpath(candidate) };
-    } catch { return { tag, source: null }; }
+      return { tag, source: await readPath(candidate) };
+    } catch (error) {
+      if (error.code === "ENOENT") return { tag, source: null };
+      throw error;
+    }
   }));
   const inputs = suppliedHtml === undefined ? [await sourceIdentity(composition)] : [];
   if (row.silentDuration !== undefined) {
@@ -150,7 +165,7 @@ export async function validateAudio(row, composition, project, contract, fps, su
   for (const [index, segment] of supplied.entries()) {
     if (!segment || typeof segment.source !== "string" || !segment.source.trim()) throw new Error(`主音频第 ${index + 1} 段缺少源文件`);
     const candidate = path.resolve(project, segment.source);
-    const source = await fs.realpath(candidate);
+    const source = await readPath(candidate);
     if (!inside(contract.audioDir, source) && !inside(contract.workspace, source)) throw new Error(`主音频第 ${index + 1} 段超出音频目录/任务工作目录`);
     const info = await mediaInfo(source);
     const duration = Number(info.format?.duration);
@@ -182,7 +197,7 @@ export async function validateAudio(row, composition, project, contract, fps, su
 }
 
 export async function verifyVideo(file, audioTarget, fps) {
-  const stat = await fs.stat(file);
+  const stat = await readStat(file);
   if (!stat.isFile() || stat.size === 0) throw new Error(`输出为空：${file}`);
   const info = await mediaInfo(file);
   const video = info.streams?.find((entry) => entry.codec_type === "video");
@@ -219,10 +234,10 @@ function receiptPath(context, row) { return path.join(context.deliveryDir, `${ro
 
 async function readReceipt(context, row) {
   const file = receiptPath(context, row);
-  const stat = await fs.lstat(file).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+  const stat = await readLinkStat(file).catch(absentPath);
   if (!stat) return null;
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`第 ${row.index + 1} 条完成凭据不是普通文件`);
-  const receipt = JSON.parse(await fs.readFile(file, "utf8"));
+  const receipt = JSON.parse(await readText(file));
   if (receipt.version !== 1 || receipt.index !== row.index + 1 || !same(receipt.output, row.output)
     || receipt.rowSignature !== row.rowSignature) {
     throw new Error(`第 ${row.index + 1} 条已完成成片的工程或主音频被改写；请保持原交付行不变`);
@@ -245,7 +260,7 @@ async function publishReceipt(context, row, verified, renderedFile) {
 
 async function assertInputsUnchanged(row) {
   for (const input of row.audio.inputs) {
-    const stat = await fs.stat(input.path);
+    const stat = await readStat(input.path);
     if (stat.size !== input.size || stat.mtimeMs !== input.mtimeMs || await sha256(input.path) !== input.sha256) {
       throw new Error(`第 ${row.index + 1} 条渲染期间主音频或工程发生变化，请重新核对清单`);
     }
@@ -254,16 +269,16 @@ async function assertInputsUnchanged(row) {
 
 async function deliveryContext(options) {
   if (!options.workspace || !options["output-dir"]) throw new Error("需要 --workspace 和 --output-dir 指向本任务工作目录及输出目录");
-  const workspace = await fs.realpath(options.workspace);
-  const outputDir = await fs.realpath(options["output-dir"]);
-  const deliveryDir = await fs.realpath(path.join(workspace, "..", "delivery"));
-  const contractPath = await fs.realpath(path.join(deliveryDir, "contract.json"));
+  const workspace = await readPath(options.workspace);
+  const outputDir = await readPath(options["output-dir"]);
+  const deliveryDir = await readPath(path.join(workspace, "..", "delivery"));
+  const contractPath = await readPath(path.join(deliveryDir, "contract.json"));
   if (!inside(deliveryDir, contractPath)) throw new Error("任务交付契约路径越界");
-  const contract = JSON.parse(await fs.readFile(contractPath, "utf8"));
+  const contract = JSON.parse(await readText(contractPath));
   const contractWorkspace = typeof contract.workspace === "string"
-    ? await fs.realpath(contract.workspace).catch(() => null) : null;
+    ? await readPath(contract.workspace).catch(absentPath) : null;
   const contractOutputDir = typeof contract.outputDir === "string"
-    ? await fs.realpath(contract.outputDir).catch(() => null) : null;
+    ? await readPath(contract.outputDir).catch(absentPath) : null;
   if (contract.version !== 1 || !Array.isArray(contract.slots) || !contract.slots.length
     || contract.slots.length > 20 || !contractWorkspace || !contractOutputDir
     || !same(contractWorkspace, workspace) || !same(contractOutputDir, outputDir)
@@ -276,7 +291,7 @@ async function deliveryContext(options) {
     throw new Error("任务交付文件名与任务编号不符");
   }
   contract.workspace = workspace;
-  contract.audioDir = await fs.realpath(contract.audioDir);
+  contract.audioDir = await readPath(contract.audioDir);
   return { workspace, outputDir, deliveryDir, contract };
 }
 
@@ -286,7 +301,7 @@ export async function createManifestTemplate(options) {
   if (!options.manifest) throw new Error("template 需要 --manifest 指向新清单文件");
   const context = await deliveryContext(options);
   const candidate = path.resolve(options.manifest);
-  const parent = await fs.realpath(path.dirname(candidate));
+  const parent = await readPath(path.dirname(candidate));
   const file = path.join(parent, path.basename(candidate));
   if (!inside(context.workspace, parent) || same(file, path.join(context.workspace, "media-policy.json"))) {
     throw new Error("模板必须写入当前任务工作目录中的新 JSON 文件，不能写入任务配置");
@@ -316,7 +331,7 @@ export async function validatedManifest(options) {
   const { workspace, outputDir, deliveryDir, contract } = await deliveryContext(options);
   const manifestPath = await existingFieldPath(path.resolve(options.manifest), workspace, "manifest", "file");
   let manifest;
-  try { manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")); }
+  try { manifest = JSON.parse(await readText(manifestPath)); }
   catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     invalid("JSON", "manifest", `JSON 解析失败：${error.message}`, "请修正 JSON 语法，不添加 Markdown 围栏或注释；用 template 创建初始格式。");
@@ -357,9 +372,9 @@ export async function validatedManifest(options) {
     const output = path.resolve(outputDir, row.output);
     if (!inside(outputDir, output) || output === outputDir) throw new Error(`第 ${index + 1} 行的输出路径越界`);
     await fs.mkdir(path.dirname(output), { recursive: true });
-    const realParent = await fs.realpath(path.dirname(output));
+    const realParent = await readPath(path.dirname(output));
     if (!inside(outputDir, realParent)) throw new Error(`第 ${index + 1} 行的输出目录通过符号链接越界`);
-    const existing = await fs.lstat(output).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    const existing = await readLinkStat(output).catch(absentPath);
     if (existing?.isSymbolicLink()) throw new Error(`第 ${index + 1} 行的输出是符号链接`);
     if (seen.has(output.toLowerCase())) throw new Error("渲染清单有重复输出路径");
     seen.add(output.toLowerCase());
@@ -471,7 +486,7 @@ async function runQueue(options) {
   const pending = [];
   for (const row of rows) {
     const entry = manifest.rows[row.index];
-    const existing = await fs.stat(row.output).catch((error) => error.code === "ENOENT" ? null : Promise.reject(error));
+    const existing = await readStat(row.output).catch(absentPath);
     if (existing) {
       const receipt = await readReceipt(context, row);
       if (!receipt) {

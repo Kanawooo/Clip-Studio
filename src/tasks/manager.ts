@@ -11,8 +11,13 @@ import { errorMessage, redactSecrets } from "../security.js";
 import {
   diffVideoOutputs,
   filterPlayableVideoFiles,
+  isOutputReadUnavailable,
+  outputReadRecoveryExhausted,
+  readOutput,
+  recoverOutputRead,
   snapshotOutputDir,
   videoProbeFailure,
+  waitForOutputRead,
   waitForStableVideoFiles,
   type VideoSnapshot,
 } from "./outputs.js";
@@ -57,8 +62,18 @@ interface TaskRuntime {
   persistPromise: Promise<void>;
   secrets: string[];
   disposed: boolean;
+  disposePromise: Promise<void>;
   outputFailures: Map<string, string>;
   deliveryProofs: Map<number, DeliveryProof>;
+  readController: AbortController;
+  readFailure: { count: number; firstAt: number; error: unknown } | null;
+  statusBeforeReadFailure?: string;
+  finishing: boolean;
+  attempt: number;
+  abortPromise: Promise<void> | null;
+  historyRecovery: Promise<void> | null;
+  historyVerified: boolean;
+  historyReadError?: string;
 }
 
 export interface TaskManagerOptions {
@@ -153,12 +168,13 @@ export class TaskManager {
   }
 
   getTask(taskId: string): Task | undefined {
-    return this.runtimes.get(taskId)?.task;
+    const runtime = this.runtimes.get(taskId);
+    return runtime ? this.taskView(runtime) : undefined;
   }
 
   listTasks(): Task[] {
     return [...this.runtimes.values()]
-      .map((runtime) => runtime.task)
+      .map((runtime) => this.taskView(runtime))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
@@ -222,8 +238,16 @@ export class TaskManager {
       persistPromise: Promise.resolve(),
       secrets: [input.model.apiKey].filter(Boolean),
       disposed: false,
+      disposePromise: Promise.resolve(),
       outputFailures: new Map(),
       deliveryProofs: new Map(),
+      readController: new AbortController(),
+      readFailure: null,
+      finishing: false,
+      attempt: 0,
+      abortPromise: null,
+      historyRecovery: null,
+      historyVerified: true,
     };
     task.model = {
       ...task.model,
@@ -261,6 +285,8 @@ export class TaskManager {
 
   private async retryReservedTask(runtime: TaskRuntime, model: ModelConfig): Promise<Task> {
     await runtime.promptPromise?.catch(() => undefined);
+    await runtime.disposePromise;
+    await runtime.historyRecovery;
     const original = runtime.task.model;
     if (!original.fingerprint || original.fingerprint !== modelIdentityHash(model)
       || original.requestedThinkingLevel !== (model.thinkingLevel ?? "auto")) {
@@ -280,11 +306,20 @@ export class TaskManager {
       modelCapabilityId: "",
     };
     this.validateTaskPaths(input, runtime.workspace);
-    const resumeSessionFile = await this.safeSessionFile(runtime);
     runtime.secrets = [model.apiKey].filter(Boolean);
+    runtime.readController = new AbortController();
+    let resumeSessionFile: string | undefined;
+    try {
+      resumeSessionFile = await recoverOutputRead(() => this.safeSessionFile(runtime), { signal: runtime.readController.signal });
+      await fs.mkdir(runtime.task.input.outputDir, { recursive: true });
+      await prepareDelivery(runtime.task, runtime.taskDir, runtime.workspace);
+      await recoverOutputRead(() => this.recoverOutputs(runtime), { signal: runtime.readController.signal });
+    } catch (error) {
+      throw new TaskCreateError(this.safeError(runtime, `无法恢复原任务输出：${errorMessage(error)}`), 400);
+    }
     runtime.disposed = false;
-    await prepareDelivery(runtime.task, runtime.taskDir, runtime.workspace);
-    await this.recoverOutputs(runtime);
+    runtime.historyVerified = true;
+    runtime.historyReadError = undefined;
     await Promise.all([
       fs.mkdir(runtime.workspace, { recursive: true }),
       fs.mkdir(runtime.sessionDir, { recursive: true }),
@@ -315,8 +350,10 @@ export class TaskManager {
   }
 
   private async safeSessionFile(runtime: TaskRuntime): Promise<string | undefined> {
-    const taskRoot = await fs.realpath(runtime.taskDir);
-    const sessionRoot = await fs.realpath(runtime.sessionDir).catch((error) => {
+    const read = <T>(file: string, operation: string, action: () => Promise<T>) =>
+      readOutput(operation, file, action, { signal: runtime.readController.signal });
+    const taskRoot = await read(runtime.taskDir, "任务目录/realpath", () => fs.realpath(runtime.taskDir));
+    const sessionRoot = await read(runtime.sessionDir, "Session 目录/realpath", () => fs.realpath(runtime.sessionDir)).catch((error) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
     });
@@ -324,16 +361,17 @@ export class TaskManager {
     if (!isInsideOrEqual(taskRoot, sessionRoot)) throw new TaskCreateError("原任务 Session 目录越界，无法安全恢复。", 400);
     let candidate = runtime.task.sessionFile;
     if (!candidate) {
-      const files = await fs.readdir(sessionRoot, { withFileTypes: true });
+      const files = await read(sessionRoot, "Session 目录/readdir", () => fs.readdir(sessionRoot, { withFileTypes: true }));
       const sessions = await Promise.all(files.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
         .map(async (entry) => {
           const file = path.join(sessionRoot, entry.name);
-          return { file, mtimeMs: (await fs.stat(file)).mtimeMs };
+          return { file, mtimeMs: (await read(file, "Session 文件/stat", () => fs.stat(file))).mtimeMs };
         }));
       candidate = sessions.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]?.file;
     }
     if (!candidate) return undefined;
-    const resolved = await fs.realpath(candidate).catch((error) => {
+    const sessionFile = candidate;
+    const resolved = await read(sessionFile, "Session 文件/realpath", () => fs.realpath(sessionFile)).catch((error) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
     });
@@ -345,19 +383,18 @@ export class TaskManager {
   }
 
   private async recoverOutputs(runtime: TaskRuntime): Promise<void> {
-    runtime.outputFailures.clear();
-    await fs.mkdir(runtime.task.input.outputDir, { recursive: true });
     if (runtime.task.delivery) {
-      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, true);
+      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, true, runtime.readController.signal);
       runtime.task.outputs = delivered.outputs;
+      runtime.outputFailures.clear();
       for (const failure of delivered.failures) runtime.outputFailures.set(failure, failure);
       return;
     }
     const configuredOutput = path.resolve(runtime.task.input.outputDir);
-    const outputRoot = await fs.realpath(runtime.task.input.outputDir);
+    const outputRoot = await readOutput("输出目录/realpath", runtime.task.input.outputDir, () => fs.realpath(runtime.task.input.outputDir));
     const known: Array<{ id: string; path: string }> = [];
     for (const output of runtime.task.outputs) {
-      const real = await fs.realpath(output.path).catch((error) => {
+      const real = await readOutput("历史成片/realpath", output.path, () => fs.realpath(output.path)).catch((error) => {
         if (error.code === "ENOENT") return undefined;
         throw error;
       });
@@ -366,7 +403,8 @@ export class TaskManager {
       known.push({ id: output.id, path: real });
     }
     const playableKnown = new Set((await this.outputValidator(known.map((item) => item.path))).map(normalizePathKey));
-    runtime.task.outputs = known.filter((item) => playableKnown.has(normalizePathKey(item.path)));
+    const outputs = known.filter((item) => playableKnown.has(normalizePathKey(item.path)));
+    const failures = new Map<string, string>();
     const before: VideoSnapshot = runtime.task.outputBaseline
       ? new Map(runtime.task.outputBaseline.filter((item) => isInsideOrEqual(configuredOutput, item.path))
         .map((item) => [normalizePathKey(item.path), item]))
@@ -377,19 +415,28 @@ export class TaskManager {
     const playable = await this.outputValidator(stable);
     const valid = new Set(playable.map(normalizePathKey));
     for (const file of stable) if (!valid.has(normalizePathKey(file))) {
-      runtime.outputFailures.set(normalizePathKey(file), await videoProbeFailure(file) ?? `成片无法通过验证：${file}`);
+      failures.set(normalizePathKey(file), await videoProbeFailure(file) ?? `成片无法通过验证：${file}`);
     }
-    const present = new Set(runtime.task.outputs.map((item) => normalizePathKey(item.path)));
+    const present = new Set(outputs.map((item) => normalizePathKey(item.path)));
     for (const file of playable) {
-      const real = await fs.realpath(file);
+      const real = await readOutput("成片/realpath", file, () => fs.realpath(file));
       if (!isInsideOrEqual(outputRoot, real) || present.has(normalizePathKey(real))) continue;
-      runtime.task.outputs.push({ id: randomUUID(), path: real });
+      outputs.push({ id: randomUUID(), path: real });
       present.add(normalizePathKey(real));
     }
+    runtime.readController.signal.throwIfAborted();
+    runtime.task.outputs = outputs;
+    runtime.outputFailures = failures;
     runtime.outputSnapshot = after;
   }
 
   private async startAttempt(runtime: TaskRuntime, input: CreateTaskInput, prompt: string | ((restored: boolean) => string), resumeSessionFile?: string): Promise<void> {
+    runtime.attempt += 1;
+    runtime.readController = new AbortController();
+    runtime.readFailure = null;
+    runtime.statusBeforeReadFailure = undefined;
+    runtime.finishing = false;
+    runtime.abortPromise = null;
     await atomicWrite(path.join(runtime.workspace, "media-policy.json"), {
       version: 1,
       taskId: runtime.task.id,
@@ -405,9 +452,8 @@ export class TaskManager {
       newTask: typeof prompt === "string" && !runtime.task.startedAt,
     });
     if (!isActive(runtime.task.status)) {
-      await runtime.session.dispose();
-      runtime.session = null;
-      runtime.disposed = true;
+      runtime.disposed = false;
+      await this.disposeSession(runtime);
       throw new TaskCreateError("任务已停止，未启动 Pi。", 409);
     }
     if (runtime.session.thinkingLevel) runtime.task.model.thinkingLevel = runtime.session.thinkingLevel;
@@ -426,30 +472,38 @@ export class TaskManager {
     const runtime = this.runtimes.get(taskId);
     if (!runtime) return undefined;
     if (runtime.task.status !== "pending" && runtime.task.status !== "running") return runtime.task;
+    const attempt = runtime.attempt;
+    const stoppedAttempt = () => runtime.attempt === attempt && runtime.task.status === "aborted";
 
     await this.finish(runtime, "aborted", "任务已停止");
     try {
-      await runtime.session?.abort();
+      await this.abortSession(runtime);
     } catch {
       // The public state is already stopped. Abort failures must not restart it.
     }
     if (runtime.task.delivery) {
       await runtime.outputScan?.catch(() => undefined);
-      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, true)
-        .catch(() => undefined);
-      if (delivered) {
+      if (!stoppedAttempt()) return this.taskView(runtime);
+      try {
+        const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, new Map(runtime.deliveryProofs), true);
+        if (!stoppedAttempt()) return this.taskView(runtime);
         runtime.task.outputs = delivered.outputs;
-        await this.persist(runtime);
-        this.broadcastTask(runtime);
+      } catch (error) {
+        if (!stoppedAttempt()) return this.taskView(runtime);
+        runtime.task.error = this.safeError(runtime, `停止后输出验证未完成：${errorMessage(error)}`);
       }
+      await this.persist(runtime);
+      this.broadcastTask(runtime);
     }
-    await this.disposeSession(runtime);
+    if (stoppedAttempt()) await this.disposeSession(runtime);
     return runtime.task;
   }
 
   async shutdown(): Promise<void> {
     const active = [...this.runtimes.values()].filter((runtime) => isActive(runtime.task.status));
     await Promise.allSettled(active.map((runtime) => this.abortTask(runtime.task.id)));
+    for (const runtime of this.runtimes.values()) runtime.readController.abort();
+    await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.historyRecovery));
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.persistPromise));
   }
 
@@ -457,7 +511,12 @@ export class TaskManager {
     try {
       await runtime.session!.prompt(prompt);
       if (!isActive(runtime.task.status)) return;
-      await this.scanOutputs(runtime, true);
+      runtime.finishing = true;
+      this.stopOutputMonitor(runtime);
+      runtime.task.statusText = "正在验证输出视频";
+      this.broadcastTask(runtime);
+      await this.scanOutputsUntilAvailable(runtime);
+      if (!isActive(runtime.task.status)) return;
       const found = runtime.task.outputs.length;
       if (found >= input.generateCount) {
         await this.finish(runtime, "completed", `已完成 ${found} 条成片`);
@@ -470,48 +529,119 @@ export class TaskManager {
       }
     } catch (error) {
       if (!isActive(runtime.task.status)) return;
+      const finalVerification = runtime.finishing;
+      runtime.finishing = true;
+      this.stopOutputMonitor(runtime);
       // A completed file may still be in the debounce scan when Pi reports an error.
       // Settle and retain it before persisting the failed attempt.
       await runtime.outputScan?.catch(() => undefined);
       if (!isActive(runtime.task.status)) return;
-      await this.scanOutputs(runtime, true).catch(() => undefined);
+      let cleanupError: unknown;
+      if (!finalVerification) {
+        try { await this.scanOutputsUntilAvailable(runtime); }
+        catch (secondary) { cleanupError = secondary; }
+      }
       if (!isActive(runtime.task.status)) return;
-      const message = this.safeError(runtime, error);
-      await this.finish(runtime, "failed", "制作失败", message);
+      const message = this.safeError(runtime, `${errorMessage(error)}${cleanupError
+        ? `；输出验证亦未完成：${errorMessage(cleanupError)}` : ""}`);
+      await this.finish(runtime, "failed", finalVerification ? "无法验证输出视频" : "制作失败", message);
     } finally {
       await this.disposeSession(runtime);
     }
   }
 
   private startOutputMonitor(runtime: TaskRuntime): void {
+    const attempt = runtime.attempt;
     runtime.outputMonitor = setInterval(() => {
+      if (!isActive(runtime.task.status) || runtime.finishing || runtime.attempt !== attempt) return;
       if (Date.now() - Date.parse(runtime.task.lastHeartbeatAt ?? runtime.task.createdAt) >= 30_000) {
         runtime.task.lastHeartbeatAt = new Date().toISOString();
         this.persist(runtime);
       }
-      if (!isActive(runtime.task.status) || runtime.outputScan) return;
-      runtime.outputScan = this.scanOutputs(runtime)
-        .catch((error) => this.failFromOutputScan(runtime, error))
-        .finally(() => { runtime.outputScan = null; });
+      if (runtime.outputScan) return;
+      void this.scanOutputs(runtime).catch((error) => this.failFromOutputScan(runtime, error, attempt));
     }, this.outputScanIntervalMs);
     runtime.outputMonitor.unref?.();
   }
 
-  private async failFromOutputScan(runtime: TaskRuntime, error: unknown): Promise<void> {
-    if (!isActive(runtime.task.status)) return;
-    const message = this.safeError(runtime, error);
+  private async failFromOutputScan(runtime: TaskRuntime, error: unknown, attempt: number): Promise<void> {
+    if (!isActive(runtime.task.status) || runtime.finishing || runtime.attempt !== attempt) return;
+    if (isOutputReadUnavailable(error)) {
+      const failure = runtime.readFailure;
+      if (!failure || failure.error !== error) return;
+      if (!outputReadRecoveryExhausted(failure.count, failure.firstAt)) {
+        if (runtime.task.statusText !== "输出验证暂时不可用，制作继续") {
+          runtime.statusBeforeReadFailure = runtime.task.statusText;
+          runtime.task.statusText = "输出验证暂时不可用，制作继续";
+          await this.persist(runtime);
+          this.broadcastTask(runtime);
+          console.warn(`[clip-studio] ${runtime.task.id}: ${this.safeError(runtime, error)}`);
+        }
+        return;
+      }
+    }
+    const message = this.safeError(runtime, this.scanFailureMessage(runtime, error));
     await this.finish(runtime, "failed", "无法验证输出视频", message);
-    try { await runtime.session?.abort(); } catch { /* best effort */ }
+    if (runtime.attempt !== attempt) return;
+    try { await this.abortSession(runtime); } catch { /* best effort */ }
   }
 
   private async scanOutputs(runtime: TaskRuntime, force = false): Promise<void> {
-    const current = runtime.outputScan;
-    if (current) await current;
+    while (runtime.outputScan) {
+      if (!force) return runtime.outputScan;
+      await runtime.outputScan.catch(() => undefined);
+    }
     if (!isActive(runtime.task.status)) return;
+    const attempt = runtime.attempt;
+    const scan = this.performOutputScan(runtime, force, attempt).then(async () => {
+      if (!isActive(runtime.task.status) || runtime.attempt !== attempt) return;
+      const recovered = runtime.readFailure !== null;
+      runtime.readFailure = null;
+      if (recovered && runtime.task.statusText === "输出验证暂时不可用，制作继续") {
+        runtime.task.statusText = runtime.statusBeforeReadFailure ?? "Pi 正在调用剪辑技能并制作成片";
+        await this.persist(runtime);
+        this.broadcastTask(runtime);
+      }
+      runtime.statusBeforeReadFailure = undefined;
+    }).catch((error) => {
+      if (isActive(runtime.task.status) && runtime.attempt === attempt && isOutputReadUnavailable(error)) {
+        runtime.readFailure = { count: (runtime.readFailure?.count ?? 0) + 1,
+          firstAt: runtime.readFailure?.firstAt ?? Date.now(), error };
+      }
+      throw error;
+    });
+    runtime.outputScan = scan;
+    try { await scan; }
+    finally { if (runtime.outputScan === scan) runtime.outputScan = null; }
+  }
+
+  private async scanOutputsUntilAvailable(runtime: TaskRuntime): Promise<void> {
+    const attempt = runtime.attempt;
+    while (isActive(runtime.task.status) && runtime.attempt === attempt) {
+      try { await this.scanOutputs(runtime, true); return; }
+      catch (error) {
+        if (!isActive(runtime.task.status)) return;
+        const failure = runtime.readFailure;
+        if (!isOutputReadUnavailable(error) || !failure) throw error;
+        if (outputReadRecoveryExhausted(failure.count, failure.firstAt)) {
+          throw new Error(this.scanFailureMessage(runtime, error), { cause: error });
+        }
+        await waitForOutputRead(1_000, runtime.readController.signal);
+      }
+    }
+  }
+
+  private scanFailureMessage(runtime: TaskRuntime, error: unknown): string {
+    return isOutputReadUnavailable(error) && runtime.readFailure
+      ? `输出验证连续读取失败（${runtime.readFailure.count} 轮）：${errorMessage(error)}`
+      : errorMessage(error);
+  }
+
+  private async performOutputScan(runtime: TaskRuntime, force: boolean, attempt: number): Promise<void> {
 
     if (runtime.task.delivery) {
-      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, force);
-      if (!isActive(runtime.task.status)) return;
+      const delivered = await scanDeliveredOutputs(runtime.task, runtime.taskDir, runtime.deliveryProofs, force, runtime.readController.signal);
+      if (!isActive(runtime.task.status) || runtime.attempt !== attempt) return;
       const before = new Set(runtime.task.outputs.map((item) => item.id));
       const changed = delivered.outputs.length !== runtime.task.outputs.length
         || delivered.outputs.some((item, index) => item.id !== runtime.task.outputs[index]?.id);
@@ -530,27 +660,37 @@ export class TaskManager {
     }
 
     const after = await snapshotOutputDir(runtime.task.input.outputDir);
-    if (!isActive(runtime.task.status)) return;
+    if (!isActive(runtime.task.status) || runtime.attempt !== attempt) return;
     const changed = diffVideoOutputs(runtime.outputSnapshot, after);
-    runtime.outputSnapshot = after;
+    const failures = new Map(runtime.outputFailures);
     const stable = await waitForStableVideoFiles(changed);
     const playable = await this.outputValidator(stable);
     const valid = new Set(playable.map(normalizePathKey));
     for (const filePath of stable) {
       const key = normalizePathKey(filePath);
-      if (valid.has(key)) runtime.outputFailures.delete(key);
-      else runtime.outputFailures.set(key, await videoProbeFailure(filePath) ?? `成片无法通过验证：${filePath}`);
+      if (valid.has(key)) failures.delete(key);
+      else failures.set(key, await videoProbeFailure(filePath) ?? `成片无法通过验证：${filePath}`);
     }
     const known = new Set(runtime.task.outputs.map((output) => normalizePathKey(output.path)));
+    const added: Task["outputs"] = [];
     for (const filePath of playable) {
-      const real = await fs.realpath(filePath);
+      const real = await readOutput("成片/realpath", filePath, () => fs.realpath(filePath), { signal: runtime.readController.signal });
       const key = normalizePathKey(real);
       if (known.has(key)) continue;
       known.add(key);
-      runtime.task.outputs.push({ id: randomUUID(), path: real });
+      added.push({ id: randomUUID(), path: real });
+    }
+    if (!isActive(runtime.task.status) || runtime.attempt !== attempt) return;
+    runtime.outputSnapshot = after;
+    runtime.outputFailures = failures;
+    const startIndex = runtime.task.outputs.length;
+    runtime.task.outputs.push(...added);
+    if (added.length) {
       runtime.task.statusText = `已发现 ${runtime.task.outputs.length}/${runtime.task.input.generateCount} 条成片，Pi 仍在制作`;
-      this.persist(runtime);
-      runtime.hub.broadcast({ type: "output", timestamp: new Date().toISOString(), index: runtime.task.outputs.length - 1 });
+      await this.persist(runtime);
+      for (let index = startIndex; index < runtime.task.outputs.length; index++) {
+        runtime.hub.broadcast({ type: "output", timestamp: new Date().toISOString(), index });
+      }
       runtime.hub.broadcast({ type: "status", timestamp: new Date().toISOString(), message: runtime.task.statusText });
     }
   }
@@ -558,6 +698,7 @@ export class TaskManager {
   private async finish(runtime: TaskRuntime, status: TaskStatus, statusText: string, error?: string): Promise<void> {
     if (!isActive(runtime.task.status)) return;
     this.stopOutputMonitor(runtime);
+    runtime.readController.abort();
     runtime.task.status = status;
     runtime.task.statusText = statusText;
     if (runtime.session?.sessionFile) runtime.task.sessionFile = runtime.session.sessionFile;
@@ -577,20 +718,36 @@ export class TaskManager {
     runtime.outputMonitor = null;
   }
 
-  private async disposeSession(runtime: TaskRuntime): Promise<void> {
-    if (runtime.disposed) return;
+  private disposeSession(runtime: TaskRuntime): Promise<void> {
+    if (runtime.disposed) return runtime.disposePromise;
     runtime.disposed = true;
-    await runtime.session?.dispose();
-    runtime.session = null;
+    const session = runtime.session;
+    runtime.disposePromise = Promise.resolve().then(() => session?.dispose()).then(() => {
+      if (runtime.session === session) runtime.session = null;
+    });
+    return runtime.disposePromise;
+  }
+
+  private abortSession(runtime: TaskRuntime): Promise<void> {
+    runtime.abortPromise ??= Promise.resolve().then(() => runtime.session?.abort());
+    return runtime.abortPromise;
+  }
+
+  private taskView(runtime: TaskRuntime): Task {
+    if (runtime.historyVerified) return runtime.task;
+    const detail = runtime.historyReadError ?? "正在重新验证历史成片";
+    return { ...runtime.task, outputs: [], statusText: `${runtime.task.statusText}；${detail}`,
+      ...(runtime.historyReadError ? { error: `${runtime.task.error ? `${runtime.task.error}；` : ""}${detail}` } : {}) };
   }
 
   private broadcastTask(runtime: TaskRuntime): void {
+    const task = this.taskView(runtime);
     runtime.hub.broadcast({
       type: "task",
       timestamp: new Date().toISOString(),
-      status: runtime.task.status,
-      statusText: runtime.task.statusText,
-      ...(runtime.task.error ? { error: runtime.task.error } : {}),
+      status: task.status,
+      statusText: task.statusText,
+      ...(task.error ? { error: task.error } : {}),
     });
   }
 
@@ -634,17 +791,30 @@ export class TaskManager {
           persistPromise: Promise.resolve(),
           secrets: [],
           disposed: true,
+          disposePromise: Promise.resolve(),
           outputFailures: new Map(),
           deliveryProofs: new Map(),
+          readController: new AbortController(),
+          readFailure: null,
+          finishing: false,
+          attempt: 0,
+          abortPromise: null,
+          historyRecovery: null,
+          historyVerified: false,
         };
         this.runtimes.set(task.id, runtime);
-        if (task.delivery) {
-          task.outputs = [];
-          void scanDeliveredOutputs(task, taskDir, runtime.deliveryProofs, true).then((delivered) => {
-            task.outputs = delivered.outputs;
-            for (const failure of delivered.failures) runtime.outputFailures.set(failure, failure);
-            return this.persist(runtime);
-          }).catch(() => undefined);
+        {
+          const signal = runtime.readController.signal;
+          runtime.historyRecovery = recoverOutputRead(() => this.recoverOutputs(runtime), { signal }).then(async () => {
+            if (signal.aborted) return;
+            runtime.historyVerified = true;
+            await this.persist(runtime);
+            this.broadcastTask(runtime);
+          }).catch((error) => {
+            if (signal.aborted) return;
+            runtime.historyReadError = this.safeError(runtime, `历史成片验证未完成：${errorMessage(error)}`);
+            this.broadcastTask(runtime);
+          });
         }
         if (task.error === task.statusText && task.statusText.includes("服务在任务完成前退出")) this.persist(runtime);
       } catch {

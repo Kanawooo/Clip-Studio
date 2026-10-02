@@ -6,6 +6,27 @@ import path from "node:path";
 
 const execFileAsync = promisify(execFile);
 
+interface OutputIoModule {
+  readOutput<T>(operation: string, file: string, read: () => Promise<T>, options?: { signal?: AbortSignal }): Promise<T>;
+  recoverOutputRead<T>(read: () => Promise<T>, options?: { signal?: AbortSignal }): Promise<T>;
+  isOutputReadUnavailable(error: unknown): boolean;
+  outputReadRecoveryExhausted(count: number, firstFailureAt: number, now?: number): boolean;
+  waitForOutputRead(ms: number, signal?: AbortSignal): Promise<void>;
+}
+
+// Same fixed resource from src/tasks and dist/tasks; ships with the local skill.
+const outputIoResource: unknown = await import(new URL(
+  "../../.pi/skills/hyperframes/hyperframes-cli/scripts/output-io.mjs", import.meta.url,
+).href);
+const outputIoKeys = ["readOutput", "recoverOutputRead", "isOutputReadUnavailable", "outputReadRecoveryExhausted", "waitForOutputRead"] as const;
+if (!outputIoResource || typeof outputIoResource !== "object"
+  || outputIoKeys.some((key) => !(key in outputIoResource)
+    || typeof (outputIoResource as Record<string, unknown>)[key] !== "function")) {
+  throw new Error("输出验证只读组件缺失或无效，请检查程序运行文件");
+}
+export const { readOutput, recoverOutputRead, isOutputReadUnavailable, outputReadRecoveryExhausted, waitForOutputRead }
+  = outputIoResource as OutputIoModule;
+
 /**
  * Output discovery. No artifact database: snapshot the outputDir before the
  * task, rescan after the task, and report new/changed video files.
@@ -36,7 +57,7 @@ export async function scanVideoFiles(rootDir: string): Promise<VideoFileInfo[]> 
   async function walk(dir: string): Promise<void> {
     let entries;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      entries = await readOutput("readdir", dir, () => fs.readdir(dir, { withFileTypes: true }));
     } catch (error) {
       if (isMissing(error)) return;
       throw error;
@@ -47,7 +68,7 @@ export async function scanVideoFiles(rootDir: string): Promise<VideoFileInfo[]> 
         await walk(fullPath);
       } else if (entry.isFile() && isVideoFile(entry.name) && !entry.name.startsWith(".clip-studio-")) {
         try {
-          const stat = await fs.stat(fullPath);
+          const stat = await readOutput("stat", fullPath, () => fs.stat(fullPath));
           found.push({ path: fullPath, mtimeMs: stat.mtimeMs, size: stat.size });
         } catch (error) {
           if (!isMissing(error)) throw error;
@@ -125,7 +146,7 @@ async function statVideoFiles(files: string[]): Promise<VideoFileInfo[]> {
   const found: VideoFileInfo[] = [];
   for (const filePath of files) {
     try {
-      const stat = await fs.stat(filePath);
+      const stat = await readOutput("stat", filePath, () => fs.stat(filePath));
       if (stat.isFile()) found.push({ path: filePath, mtimeMs: stat.mtimeMs, size: stat.size });
     } catch (error) {
       if (!isMissing(error)) throw error;
@@ -172,12 +193,14 @@ export function diffVideoOutputs(before: VideoSnapshot, after: VideoSnapshot): s
  * Return a stable content identity for a finished output. This is a technical
  * delivery check only; it does not inspect or judge the video contents.
  */
-export async function videoContentHash(filePath: string): Promise<string> {
-  const hash = createHash("sha256");
-  const stream = createReadStream(filePath);
-  return new Promise((resolve, reject) => {
-    stream.on("data", (chunk: Buffer) => hash.update(chunk));
-    stream.once("error", reject);
-    stream.once("end", () => resolve(hash.digest("hex")));
-  });
+export async function videoContentHash(filePath: string, signal?: AbortSignal): Promise<string> {
+  return readOutput("hash/read", filePath, () => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath, { signal });
+    return new Promise<string>((resolve, reject) => {
+      stream.on("data", (chunk: Buffer) => hash.update(chunk));
+      stream.once("error", reject);
+      stream.once("end", () => resolve(hash.digest("hex")));
+    });
+  }, { signal });
 }
