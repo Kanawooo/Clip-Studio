@@ -15,7 +15,6 @@ import { TaskManager, type SessionStartOptions } from "../src/tasks/manager.js";
 import type { CreateTaskInput, Task } from "../src/tasks/types.js";
 import { buildCreateInput } from "../web/src/App.tsx";
 import { DEFAULT_DRAFT, DEFAULT_SETTINGS, draftFromLocalState } from "../web/src/state/storage.ts";
-import type { TaskDraft } from "../web/src/types/api.ts";
 
 const requireWeb = createRequire(new URL("../web/package.json", import.meta.url));
 const { createElement } = requireWeb("react") as typeof import("../web/node_modules/@types/react/index.js");
@@ -92,11 +91,11 @@ function failedManager(t: TestContext, value: ReturnType<typeof fixture>, onSess
   return { manager, sessionCount: () => sessions, promptCount: () => prompts };
 }
 
-test("create API normalizes the optional visual preference and rejects non-booleans", () => {
+test("create API fixes visual reuse off, including legacy true requests, and rejects non-booleans", () => {
   const { input } = fixture();
   assert.equal(parseCreateTaskInput(input).reuseVisualAnalysis, false);
   for (const choice of [false, true]) {
-    assert.equal(parseCreateTaskInput({ ...input, reuseVisualAnalysis: choice }).reuseVisualAnalysis, choice);
+    assert.equal(parseCreateTaskInput({ ...input, reuseVisualAnalysis: choice }).reuseVisualAnalysis, false);
   }
   for (const invalid of [null, "false", "true", 0, 1, [], {}]) {
     assert.throws(() => parseCreateTaskInput({ ...input, reuseVisualAnalysis: invalid }), (error: unknown) => {
@@ -128,70 +127,77 @@ test("visual reuse does not bypass the server image-capability gate", async (t) 
   assert.equal(runner.manager.listTasks().length, 0);
 });
 
-test("draft preference round-trips through the server whitelist and defaults off", async () => {
+test("draft storage discards the removed preference while preserving paths and count", async () => {
   const { projectRoot } = fixture();
   const store = new LocalStateStore(projectRoot);
-  assert.equal(DEFAULT_DRAFT.reuseVisualAnalysis, false);
-  assert.equal(draftFromLocalState(await store.view()).reuseVisualAnalysis, false);
-  for (const invalid of [undefined, null, "true", 1, {}, []]) {
-    assert.equal(draftFromLocalState({ settings: {}, mainKeyStored: false,
-      draft: { reuseVisualAnalysis: invalid } }).reuseVisualAnalysis, false);
+  assert.equal(Object.hasOwn(DEFAULT_DRAFT, "reuseVisualAnalysis"), false);
+  assert.equal(Object.hasOwn(draftFromLocalState(await store.view()), "reuseVisualAnalysis"), false);
+  for (const oldValue of [undefined, true, false, null, "true", 1, {}, []]) {
+    assert.equal(Object.hasOwn(draftFromLocalState({ settings: {}, mainKeyStored: false,
+      draft: { reuseVisualAnalysis: oldValue } }), "reuseVisualAnalysis"), false);
   }
   for (const choice of [true, false]) {
     const draft = { ...DEFAULT_DRAFT, referenceVideo: "参考.mp4", generateCount: 3,
       reuseVisualAnalysis: choice, apiKey: model.apiKey, unrelated: "discard me" };
     const saved = await store.saveDraft({ draft });
-    assert.equal(saved.draft.reuseVisualAnalysis, choice);
+    assert.equal(Object.hasOwn(saved.draft, "reuseVisualAnalysis"), false);
     assert.equal(saved.draft.apiKey, undefined);
     assert.equal(saved.draft.unrelated, undefined);
     const loaded = await new LocalStateStore(projectRoot).view();
-    assert.equal(draftFromLocalState(loaded).reuseVisualAnalysis, choice);
+    assert.equal(Object.hasOwn(draftFromLocalState(loaded), "reuseVisualAnalysis"), false);
+    assert.equal(draftFromLocalState(loaded).referenceVideo, "参考.mp4");
     assert.equal(draftFromLocalState(loaded).generateCount, 3);
     assert.doesNotMatch(readFileSync(path.join(projectRoot, ".runtime", "user-state.json"), "utf8"),
       new RegExp(model.apiKey));
   }
   const legacy = await store.saveDraft({ draft: { taskRequest: "旧草稿", generateCount: 2 } });
   assert.equal(legacy.draft.reuseVisualAnalysis, undefined);
-  assert.equal(draftFromLocalState(legacy).reuseVisualAnalysis, false);
+  assert.equal(Object.hasOwn(draftFromLocalState(legacy), "reuseVisualAnalysis"), false);
+  const stateFile = path.join(projectRoot, ".runtime", "user-state.json");
+  const oldState = JSON.parse(readFileSync(stateFile, "utf8"));
+  oldState.draft.reuseVisualAnalysis = true;
+  writeFileSync(stateFile, JSON.stringify(oldState));
+  const restored = await new LocalStateStore(projectRoot).view();
+  assert.equal(Object.hasOwn(restored.draft, "reuseVisualAnalysis"), false);
+  assert.equal(draftFromLocalState(restored).taskRequest, "旧草稿");
 });
 
-test("frontend submission forwards the normalized draft choice and preserves model gating", () => {
+test("frontend submission omits the removed preference, including legacy drafts, and preserves model gating", () => {
   const settings = { ...DEFAULT_SETTINGS, provider: "test", model: "test", apiKey: model.apiKey,
     modelCapability: { fingerprint: "test", status: "supported" as const, testedAt: new Date().toISOString(),
       capabilityId: "test-only-capability" } };
   for (const choice of [false, true]) {
-    const created = buildCreateInput({ ...DEFAULT_DRAFT, referenceVideo: " 参考.mp4 ", reuseVisualAnalysis: choice }, settings);
-    assert.equal(created.reuseVisualAnalysis, choice);
+    const legacyDraft = { ...DEFAULT_DRAFT, referenceVideo: " 参考.mp4 ", reuseVisualAnalysis: choice };
+    const created = buildCreateInput(legacyDraft, settings);
+    assert.equal(Object.hasOwn(created, "reuseVisualAnalysis"), false);
     assert.equal(created.referenceVideo, "参考.mp4");
     assert.equal(created.model.model, "test");
     assert.equal(created.modelCapabilityId, "test-only-capability");
   }
-  const oldDraft = { ...DEFAULT_DRAFT } as Partial<TaskDraft>;
-  delete oldDraft.reuseVisualAnalysis;
-  assert.equal(buildCreateInput(oldDraft as TaskDraft, settings).reuseVisualAnalysis, false);
+  assert.equal(Object.hasOwn(buildCreateInput(DEFAULT_DRAFT, settings), "reuseVisualAnalysis"), false);
   assert.throws(() => buildCreateInput(DEFAULT_DRAFT, { ...settings, modelCapability: null }), /图片理解能力/);
 });
 
-test("composer renders one default-off checkbox and locks it during an active task", () => {
+test("composer removes the visual-reuse control in all states and retains the simple task form", () => {
   const props = { draft: DEFAULT_DRAFT, disabled: false, submitting: false, settingsReady: true,
     onChange: () => {}, onSubmit: () => {}, onError: () => {} };
   const render = (overrides: Partial<typeof props> = {}) => renderToStaticMarkup(createElement(TaskComposer, { ...props, ...overrides }));
-  const checkbox = (html: string) => html.match(/<input[^>]*id="reuse-visual-analysis"[^>]*>/)?.[0] ?? "";
-  const normal = render();
-  assert.match(normal, /复用 AI 画面分析/);
-  assert.match(normal, /开启后复用已有分析，选镜仍看图。/);
-  assert.equal((normal.match(/type="checkbox"/g) ?? []).length, 1);
-  assert.match(checkbox(normal), /type="checkbox"/);
-  assert.doesNotMatch(checkbox(normal), /checked|disabled/);
-  assert.match(checkbox(render({ draft: { ...DEFAULT_DRAFT, reuseVisualAnalysis: true } })), /checked/);
-  assert.match(checkbox(render({ disabled: true })), /disabled/);
-  assert.match(checkbox(render({ submitting: true })), /disabled/);
+  const legacyDraft = { ...DEFAULT_DRAFT, reuseVisualAnalysis: true };
+  for (const html of [render(), render({ draft: legacyDraft }), render({ disabled: true }), render({ submitting: true })]) {
+    assert.doesNotMatch(html, /复用 AI 画面分析|reuse-visual-analysis|开启后复用已有分析/);
+    assert.equal((html.match(/type="checkbox"/g) ?? []).length, 0);
+    for (const id of ["reference-video", "assets-directory", "audio-directory", "output-directory", "generate-count", "task-request"]) {
+      assert.ok(html.includes(`id="${id}"`), `retains ${id}`);
+    }
+    assert.match(html, /class="primary-button start-button"/);
+    assert.match(html, /开始制作|正在准备…/);
+  }
 });
 
 for (const choice of [undefined, false, true]) {
-  test(`new task persists preference ${choice ?? "omitted/off"} and writes policy before each single Session`, async (t) => {
+  test(`new task forces legacy preference ${choice ?? "omitted"} off before each single Session and retry`, async (t) => {
     const value = fixture();
-    const normalized = choice === true;
+    const normalized = false;
     const policies: Record<string, unknown>[] = [];
     const runner = failedManager(t, value, (input, workspace, options) => {
       const policy = readPolicy(workspace);
@@ -229,30 +235,33 @@ for (const choice of [undefined, false, true]) {
   });
 }
 
-test("legacy stored tasks keep permissive reuse without adding a preference to history", async (t) => {
-  const value = fixture();
-  const original = failedManager(t, value);
-  const task = await original.manager.createTask(value.input);
-  await waitUntil(() => task.status === "failed");
-  await original.manager.shutdown();
-  const taskFile = path.join(value.tasksDir, task.id, "task.json");
-  const legacy = JSON.parse(readFileSync(taskFile, "utf8"));
-  delete legacy.input.reuseVisualAnalysis;
-  writeFileSync(taskFile, JSON.stringify(legacy));
-  const recreated = failedManager(t, value, (input, workspace, options) => {
-    assert.equal(input.reuseVisualAnalysis, undefined);
-    assert.deepEqual(readPolicy(workspace), { version: 1, taskId: options.taskId, reuseVisualAnalysis: true,
-      inputs: { referenceVideo: value.input.referenceVideo, assetsDir: value.input.assetsDir, audioDir: value.input.audioDir } });
+for (const choice of [undefined, false, true]) {
+  test(`legacy stored preference ${choice ?? "omitted"} stays in history but retry executes with visual reuse off`, async (t) => {
+    const value = fixture();
+    const original = failedManager(t, value);
+    const task = await original.manager.createTask(value.input);
+    await waitUntil(() => task.status === "failed");
+    await original.manager.shutdown();
+    const taskFile = path.join(value.tasksDir, task.id, "task.json");
+    const legacy = JSON.parse(readFileSync(taskFile, "utf8"));
+    if (choice === undefined) delete legacy.input.reuseVisualAnalysis;
+    else legacy.input.reuseVisualAnalysis = choice;
+    writeFileSync(taskFile, JSON.stringify(legacy));
+    const recreated = failedManager(t, value, (input, workspace, options) => {
+      assert.equal(input.reuseVisualAnalysis, false);
+      assert.deepEqual(readPolicy(workspace), { version: 1, taskId: options.taskId, reuseVisualAnalysis: false,
+        inputs: { referenceVideo: value.input.referenceVideo, assetsDir: value.input.assetsDir, audioDir: value.input.audioDir } });
+    });
+    assert.equal(recreated.manager.getTask(task.id)?.input.reuseVisualAnalysis, choice);
+    assert.equal(recreated.sessionCount(), 0, "reading history does not create a Session");
+    const restored = await recreated.manager.retryTask(task.id, { ...model });
+    await waitUntil(() => restored?.status === "failed");
+    assert.equal(restored?.id, task.id);
+    assert.equal(recreated.sessionCount(), 1);
+    assert.equal(recreated.promptCount(), 1);
+    assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).input.reuseVisualAnalysis, choice);
   });
-  assert.equal(recreated.manager.getTask(task.id)?.input.reuseVisualAnalysis, undefined);
-  assert.equal(recreated.sessionCount(), 0, "reading history does not create a Session");
-  const restored = await recreated.manager.retryTask(task.id, { ...model });
-  await waitUntil(() => restored?.status === "failed");
-  assert.equal(restored?.id, task.id);
-  assert.equal(recreated.sessionCount(), 1);
-  assert.equal(recreated.promptCount(), 1);
-  assert.equal(JSON.parse(readFileSync(taskFile, "utf8")).input.reuseVisualAnalysis, undefined);
-});
+}
 
 test("invalid persisted preferences are ignored rather than treated as permissive legacy tasks", async (t) => {
   const value = fixture();

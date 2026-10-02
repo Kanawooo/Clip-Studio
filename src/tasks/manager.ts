@@ -190,7 +190,7 @@ export class TaskManager {
   }
 
   private async createReservedTask(input: CreateTaskInput): Promise<Task> {
-    input = { ...input, reuseVisualAnalysis: input.reuseVisualAnalysis === true };
+    input = { ...input, reuseVisualAnalysis: false };
     const taskId = randomUUID();
     const taskDir = path.join(this.tasksDir, taskId);
     const workspace = path.join(taskDir, "workspace");
@@ -432,6 +432,8 @@ export class TaskManager {
   }
 
   private async startAttempt(runtime: TaskRuntime, input: CreateTaskInput, prompt: string | ((restored: boolean) => string), resumeSessionFile?: string): Promise<void> {
+    // Legacy task records remain readable; every execution uses task-local analysis.
+    input = { ...input, reuseVisualAnalysis: false };
     runtime.attempt += 1;
     runtime.readController = new AbortController();
     runtime.readFailure = null;
@@ -441,7 +443,7 @@ export class TaskManager {
     await atomicWrite(path.join(runtime.workspace, "media-policy.json"), {
       version: 1,
       taskId: runtime.task.id,
-      reuseVisualAnalysis: runtime.task.input.reuseVisualAnalysis ?? true,
+      reuseVisualAnalysis: false,
       inputs: {
         referenceVideo: runtime.task.input.referenceVideo,
         assetsDir: runtime.task.input.assetsDir,

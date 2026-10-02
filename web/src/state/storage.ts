@@ -36,7 +36,6 @@ export const DEFAULT_DRAFT: TaskDraft = {
   outputDir: "",
   taskRequest: "",
   generateCount: 1,
-  reuseVisualAnalysis: false,
 };
 
 export function settingsFromLocalState(state: LocalStateResponse): AppSettings {
@@ -81,7 +80,6 @@ export function draftFromLocalState(state: LocalStateResponse): TaskDraft {
     generateCount: Number.isInteger(value.generateCount) && Number(value.generateCount) > 0
       ? Math.min(Number(value.generateCount), 20)
       : 1,
-    reuseVisualAnalysis: value.reuseVisualAnalysis === true,
   };
 }
 

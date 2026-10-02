@@ -15,11 +15,11 @@ description: 面向 AI Agent 的视频剪辑技能套件，把各大剪辑博主
 
 `overviewFile` 与 `overview --workspace <工作目录> --offset 25 --limit 25` 仍供分页查看；候选完整详情用 `entry --id <素材标识> --workspace <工作目录>`，也支持原有 `entry --file <视频> --kind source --workspace <工作目录>`。完整 `media-index.json` 由 CLI 维护。标识来自当前目录，源文件变化后重新 `index` 获得新标识；`locate` 只查已生成的图片与元信息。剪辑方案中的 source 使用定位结果的准确路径。
 
-`cacheHit` 表示基础媒体文件身份未变。FFprobe、高清帧、宫格和匹配配置的转写继续复用。`workspace/media-policy.json` 是任务的只读配置：默认关闭跨任务 AI 画面分析复用，新任务仍独立看缓存图片；开启时，中立描述帮助找候选，选用画面仍读取对应宫格或局部图。参考判断每个任务重做，同任务观察可继续使用。`absent/partial/incompatible` 表示分析缺失、不完整或失效；文字覆盖范围之外的素材需要看图补充判断。
+`cacheHit` 表示基础媒体文件身份未变。FFprobe、高清帧、宫格和匹配配置的转写继续复用。`workspace/media-policy.json` 是任务的只读配置：画面分析仅供当前任务使用，新任务独立看缓存图片。参考判断每个任务重做，同任务观察可继续使用。`absent/partial/incompatible` 表示分析缺失、不完整或失效；文字覆盖范围之外的素材需要看图补充判断。
 
 概览是最长边 2000 以内的 JPEG，按实际显示比例、旋转及像素宽高比自动布局和拆页。候选细节用 `detail --file <视频> --at <秒> --workspace <工作目录> --output <工作目录中的图片>`，`--original` 输出原始长边；连续候选用 `window --file <视频> --start <秒> --end <秒> --workspace <工作目录>` 每秒检查局部区间。`resheet --file <视频> --kind source --workspace <工作目录> --batch-size 9 --max-sheet 2000` 从已有帧重组较小宫格。
 
-已有中立观察与实际转写可一次批量保存：在工作目录写 `{"version":1,"rows":[{"id":"<目录中的准确素材标识>","observation":{"text":"已看到的内容","coverage":[[0,3]],"complete":false}}]}`，用 `annotate-batch --workspace <工作目录> --manifest <该 JSON>`；也支持 file/kind，音频行可写 transcript。`complete:true` 需要覆盖整段媒体，局部观察保持 partial。观察用于追溯和用户开启的跨任务复用；保存文字不会撤掉选镜期间的真实图片，无需每批长篇笔记。单条已有文字可用 `annotate --file <媒体> --kind source --text-file <工作目录中的 UTF-8 文本>`，转写加 `--transcript`。
+已有中立观察与实际转写可一次批量保存：在工作目录写 `{"version":1,"rows":[{"id":"<目录中的准确素材标识>","observation":{"text":"已看到的内容","coverage":[[0,3]],"complete":false}}]}`，用 `annotate-batch --workspace <工作目录> --manifest <该 JSON>`；也支持 file/kind，音频行可写 transcript。`complete:true` 需要覆盖整段媒体，局部观察保持 partial。观察用于本任务内追溯与后续成片复用；保存文字不会撤掉选镜期间的真实图片，无需每批长篇笔记。单条已有文字可用 `annotate --file <媒体> --kind source --text-file <工作目录中的 UTF-8 文本>`，转写加 `--transcript`。
 
 需要转写的独立音频可统一写为 `{"version":1,"rows":[{"id":"<目录中的准确音频标识>"}]}`（也支持 `file` 与 `kind:"audio"`），用 `transcribe-batch --workspace <工作目录> --manifest <清单 JSON>`，按本机 CPU/可用内存并行并自动保存结果；使用已安装的 Whisper 与模型，默认 small.en。可通过 `--model`、`--language` 选择本机已有的配置，相同源文件及配置才复用完整转写。纯音乐无需语音转写。
 

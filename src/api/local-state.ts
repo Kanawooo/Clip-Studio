@@ -220,7 +220,6 @@ function safeDraft(value: unknown): Record<string, unknown> {
     outputDir: text(raw.outputDir),
     taskRequest: text(raw.taskRequest),
     generateCount: integer(raw.generateCount),
-    reuseVisualAnalysis: boolean(raw.reuseVisualAnalysis),
   });
 }
 

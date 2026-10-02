@@ -107,14 +107,16 @@ test("machine-aware concurrency scales with CPU and available memory", () => {
   assert.equal(automaticParallelism(16, 1024 ** 3, { cpus: 32, freeMemory: 1024 ** 3 }), 1);
 });
 
-test("legacy missing policy stays permissive, explicit invalid policy fails", async () => {
+test("missing policy and legacy enabled policy both use task-local analysis; invalid policy still fails", async () => {
   const workspace = task("legacy");
-  assert.equal((await readMediaPolicy(workspace)).reuseVisualAnalysis, true);
+  assert.equal((await readMediaPolicy(workspace)).reuseVisualAnalysis, false);
+  const enabled = task("legacy-enabled", true);
+  assert.equal((await readMediaPolicy(enabled)).reuseVisualAnalysis, false);
   writeFileSync(path.join(workspace, "media-policy.json"), JSON.stringify({ version: 3, taskId: "legacy", reuseVisualAnalysis: false }));
   await assert.rejects(readMediaPolicy(workspace), /media-policy.json/);
 });
 
-test("OFF hides every foreign observation entry while keeping images and independent transcripts", { skip: !hasMediaRuntime }, async () => {
+test("all tasks hide foreign observations, even legacy ON, while keeping images and independent transcripts", { skip: !hasMediaRuntime }, async () => {
   const first = task("first", false);
   const indexed = await index(first);
   const source = json(indexed.indexFile).sources[0];
@@ -137,8 +139,36 @@ test("OFF hides every foreign observation entry while keeping images and indepen
 
   const third = task("third", true);
   const reused = await index(third);
-  assert.match(json(reused.indexFile).sources[0].observation, /Neutral/);
-  assert.equal(json(reused.indexFile).sources[0].analysis.observation.state, "full");
+  assert.equal(json(reused.indexFile).sources[0].observation, null);
+  assert.equal(json(reused.indexFile).sources[0].analysis.observation.state, "absent");
+  assert.equal(json(reused.indexFile).sources[0].cacheHit, true);
+  const foreign = json(source.entry).analysis.observation;
+  for (const [workspace, current] of [[second, other], [third, reused]] as const) {
+    const source = json(current.indexFile).sources[0];
+    const staleView = { ...json(source.entry), observation: foreign.text,
+      analysis: { ...json(source.entry).analysis, observation: foreign } };
+    // Existing ON workspaces can contain foreign descriptions in their views.
+    writeFileSync(source.entry, JSON.stringify(staleView));
+    const located = await locate({ workspace, ids: mediaIds([{ ...source, kind: "source" }])[0].id });
+    assert.doesNotMatch(JSON.stringify(located), /Neutral hand\/tool/);
+    writeFileSync(source.entry, JSON.stringify(staleView));
+    await overview({ workspace }, context);
+    assert.equal(json(source.entry).observation, null);
+    await entryDetails({ workspace, file: video, kind: "source" }, context);
+    await overview({ workspace }, context);
+    for (const value of [json(source.entry), json(current.overviewFile), located]) {
+      assert.doesNotMatch(JSON.stringify(value), /Neutral hand\/tool/);
+    }
+    assert.doesNotMatch(readFileSync(current.catalogFile, "utf8"), /Neutral hand\/tool/);
+    assert.match(json(current.indexFile).audio[0].transcript, /actual spoken/);
+    assert.ok(existsSync(source.sheets[0].path));
+  }
+  await annotateBatch({ workspace: third, manifest: manifest(third, [{ file: video, kind: "source",
+    observation: { text: "Current third-task selection", coverage: [[0, 5]], complete: true } }]) }, context);
+  await index(third);
+  assert.match(json(json(reused.indexFile).sources[0].entry).observation, /Current third-task/);
+  await index(first);
+  assert.match(json(source.entry).observation, /Neutral/, "own notes survive another task updating shared metadata");
   await entryDetails({ workspace: second, file: video, kind: "source" }, context);
   assert.equal(json(json(other.indexFile).sources[0].entry).observation, null);
   await overview({ workspace: second }, context);
@@ -451,7 +481,7 @@ test("legacy task workspaces recover selected roots from the backend record, not
     input:{referenceVideo:reference, assetsDir:assets, audioDir:audio}}));
   const indexed = await index(workspace);
   assert.equal(json(indexed.indexFile).sources[0].cacheHit, true);
-  assert.equal((await readMediaPolicy(workspace)).reuseVisualAnalysis, true);
+  assert.equal((await readMediaPolicy(workspace)).reuseVisualAnalysis, false);
   const wrong = {...json(path.join(taskDir, "task.json")), id:"different-task"};
   writeFileSync(path.join(taskDir, "task.json"), JSON.stringify(wrong));
   await assert.rejects(index(workspace), /不属于当前任务/);

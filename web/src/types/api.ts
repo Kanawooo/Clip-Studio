@@ -32,7 +32,6 @@ export interface CreateTaskInput {
   outputDir: string;
   taskRequest: string;
   generateCount: number;
-  reuseVisualAnalysis?: boolean;
   model: ModelConfig;
   modelCapabilityId: string;
 }
@@ -151,5 +150,4 @@ export interface TaskDraft {
   outputDir: string;
   taskRequest: string;
   generateCount: number;
-  reuseVisualAnalysis: boolean;
 }

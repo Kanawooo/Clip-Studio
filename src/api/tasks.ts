@@ -60,7 +60,7 @@ export function parseCreateTaskInput(body: unknown): CreateTaskInput {
     audioDir,
     outputDir,
     generateCount: Number(generateCount),
-    reuseVisualAnalysis: raw.reuseVisualAnalysis === true,
+    reuseVisualAnalysis: false,
     taskRequest: taskRequestString(raw.taskRequest),
     model: parseModelConfig(raw.model),
     modelCapabilityId: requiredString(raw.modelCapabilityId, "modelCapabilityId"),

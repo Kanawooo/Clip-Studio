@@ -95,13 +95,13 @@ async function writeTaskJson(workspace, file, value) {
 
 export async function readMediaPolicy(workspace) {
   workspace = await fs.realpath(workspace);
-  const fallback = { version: 1, taskId: createHash("sha256").update(workspace).digest("hex"), reuseVisualAnalysis: true };
+  const fallback = { version: 1, taskId: createHash("sha256").update(workspace).digest("hex"), reuseVisualAnalysis: false };
   try {
     const policyFile = await taskInput(workspace, path.join(workspace, "media-policy.json"));
     const policy = JSON.parse(await fs.readFile(policyFile, "utf8"));
     if (policy.version !== 1 || typeof policy.taskId !== "string" || !policy.taskId
       || typeof policy.reuseVisualAnalysis !== "boolean") throw new Error("media-policy.json 需要 version:1、taskId 和布尔 reuseVisualAnalysis");
-    return policy;
+    return { ...policy, reuseVisualAnalysis: false };
   } catch (error) {
     if (error.code === "ENOENT") return fallback;
     throw error;
@@ -432,7 +432,7 @@ export async function materializeTaskView(item, workspace, kind) {
   });
   const sameTask = local.sourceKey === sourceKey && local.taskId === policy.taskId ? local : {};
   const sourceObservation = sameTask.observationRecord ??
-    ((kind !== "reference" && policy.reuseVisualAnalysis) || item.observationRecord?.originTaskId === policy.taskId
+    (item.observationRecord?.originTaskId === policy.taskId
       ? item.observationRecord ?? item.observation : null);
   const analysis = {
     observation: analysisRecord(sourceObservation, sourceKey, item.duration),
@@ -444,7 +444,7 @@ export async function materializeTaskView(item, workspace, kind) {
     observation: analysis.observation.text, transcript: analysis.transcript.text,
     analysis, frames, sheets, entry: path.join(viewDir, "entry.json"),
   };
-  // Do not copy the shared entry verbatim: OFF must also hide foreign text here.
+  // Task views expose only current-task observations, not shared foreign text.
   await writeTaskJson(workspaceReal, view.entry, view);
   return view;
 }
@@ -694,7 +694,7 @@ export async function locate(options) {
     const view = JSON.parse(await fs.readFile(await taskInput(workspace, indexed.entry), "utf8"));
     if (view.sourceKey !== indexed.sourceKey || view.source !== indexed.source) throw new Error(`素材 ${id} 详情失效，请执行 index`);
     const record = view.analysis?.observation;
-    const observation = ((view.kind !== "reference" && policy.reuseVisualAnalysis) || record?.originTaskId === policy.taskId)
+    const observation = record?.originTaskId === policy.taskId
       ? analysisRecord(record, view.sourceKey, view.duration) : analysisRecord(null, view.sourceKey, view.duration);
     for (const [page, sheet] of view.sheets.entries()) {
       const actual = await taskInput(workspace, sheet.path);
@@ -939,7 +939,7 @@ export async function overview(options, overrides = {}) {
     const view = JSON.parse(await fs.readFile(await taskInput(workspace, entry.entry), "utf8"));
     if (view.source !== entry.source || view.sourceKey !== entry.sourceKey || !view.analysis) throw new Error("任务素材详情与索引不一致，请先执行 index");
     const record = view.analysis.observation;
-    const observation = ((entry.kind !== "reference" && policy.reuseVisualAnalysis) || record?.originTaskId === policy.taskId)
+    const observation = record?.originTaskId === policy.taskId
       ? analysisRecord(record, view.sourceKey, view.duration) : analysisRecord(null, view.sourceKey, view.duration);
     const transcript = analysisRecord(view.analysis.transcript, view.sourceKey, view.duration);
     const filtered = { ...view, kind: entry.kind, observation: observation.text, transcript: transcript.text,

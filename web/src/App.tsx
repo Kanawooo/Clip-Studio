@@ -346,7 +346,6 @@ export function buildCreateInput(draft: TaskDraft, settings: AppSettings): Creat
     outputDir: draft.outputDir.trim(),
     taskRequest: draft.taskRequest.trim(),
     generateCount: Math.min(20, Math.max(1, draft.generateCount)),
-    reuseVisualAnalysis: draft.reuseVisualAnalysis === true,
     model: buildModelInput(settings),
     modelCapabilityId,
   };
