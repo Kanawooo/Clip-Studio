@@ -8,6 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readOutput } from "./output-io.mjs";
+import { admissionBudget, classifyRenderFailure, publicError, rowFailureMessage, sourceDiagnostic } from "./render-support.mjs";
+import { prepareRenderComposition } from "./render-resources.mjs";
+export { publicError } from "./render-support.mjs";
 
 const readPath = (file) => readOutput("交付路径/realpath", file, () => fs.realpath(file));
 const readStat = (file) => readOutput("交付文件/stat", file, () => fs.stat(file));
@@ -51,40 +54,24 @@ async function existingFieldPath(candidate, root, field, type) {
   return actual;
 }
 
-export function shouldAdmit({ active, logicalCpus, cpuBusy, freeBytes, totalBytes, observedWorkerBytes }) {
-  if (active === 0) return true;
-  const reserve = Math.max(512 * MiB, totalBytes * 0.1);
-  const worker = Math.max(512 * MiB, observedWorkerBytes || 0);
-  return active < logicalCpus && cpuBusy < 0.85 && freeBytes > reserve + worker * 1.2;
-}
-
-function isHardwareFailure(message) {
-  return /\b(?:nvenc|vaapi|qsv|videotoolbox|gpu|encoder|hardware|device|cuda|amf)\b/i.test(message);
-}
+export const shouldAdmit = (values) => admissionBudget(values).admit;
 
 function inside(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-export function publicError(value) {
-  return String(value)
-    .replace(/\b(sk-[A-Za-z0-9_-]{8,})\b/g, "***")
-    .replace(/\b(Authorization\s*:\s*)(?:Bearer\s+)?[^\s,;"']+/gi, "$1***")
-    .replace(/([?&](?:key|api[_-]?key|token|access_token)=)[^&#\s]+/gi, "$1***")
-    .replace(/\b((?:api[_-]?key|x-api-key)\s*[:=]\s*)[^\s,;"']+/gi, "$1***")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ").slice(-2_000);
-}
-
-async function runCapture(command, args, maxBytes = 2_000_000) {
+async function runCapture(command, args, maxBytes = 2_000_000, duringStop = false) {
+  if (interrupted && !duringStop) throw new Error("渲染已停止");
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true, shell: false });
+    children.add(child);
     let output = "", error = "";
     child.stdout.on("data", (chunk) => { output = (output + chunk.toString()).slice(-maxBytes); });
     child.stderr.on("data", (chunk) => { error = (error + chunk.toString()).slice(-maxBytes); });
-    child.on("error", (cause) => reject(new Error(`${path.basename(command)} 启动失败：${cause.message}`)));
-    child.on("close", (code) => code === 0 ? resolve(output)
-      : reject(new Error(`${path.basename(command)} 退出码 ${code ?? "未知"}：${error.slice(-2_000) || "未提供详细原因"}`)));
+    child.on("error", (cause) => { children.delete(child); reject(new Error(`${path.basename(command)} 启动失败：${cause.message}`)); });
+    child.on("close", (code) => { children.delete(child); code === 0 && (!interrupted || duringStop) ? resolve(output)
+      : reject(new Error(`${path.basename(command)} 退出码 ${code ?? "未知"}：${error.slice(-2_000) || "未提供详细原因"}`)); });
   });
 }
 
@@ -391,9 +378,18 @@ export async function validatedManifest(options) {
       output: row.output, composition: row.composition, audioTarget: audio.target,
       silent: audio.silent, inputs: audio.inputs,
     })).digest("hex");
-    rows.push({ index, composition, output, audio, rowSignature });
+    const html = await readText(composition);
+    const root = html.match(/<[a-z][^>]*\bdata-composition-id\s*=[^>]*>/i)?.[0] ?? "";
+    const dimension = (name, fallback) => { const value = Number(attribute(root, name)); return value > 0 && value <= 16384 ? value : fallback; };
+    const pixels = dimension("data-width", 1920) * dimension("data-height", 1080);
+    const clips = [...html.matchAll(/<video\b[^>]*>/gi)].length;
+    // Existing engineering only: no new source scan/probe. Working surfaces and
+    // compressed frame buffers inform startup reservation; observed RSS refines it.
+    const estimatedWorkerBytes = 768 * MiB + pixels * Math.max(8, clips * 4) * 4
+      + (clips ? audio.target * (settings.fps ?? 30) * pixels / 8 : 0);
+    rows.push({ index, composition, output, audio, rowSignature, estimatedWorkerBytes });
   }
-  return { workspace, outputDir, deliveryDir, manifestPath, project, manifest, settings, rows };
+  return { workspace, outputDir, deliveryDir, manifestPath, project, manifest, settings, rows, contract };
 }
 
 function cpuSnapshot() {
@@ -410,14 +406,15 @@ export function cpuBusy(previous, current) {
   return total > 0 ? Math.max(0, Math.min(1, 1 - (current.idle - previous.idle) / total)) : 0;
 }
 
-async function workerRss(pids) {
-  if (!pids.length) return 0;
+async function workerResources(active) {
   try {
-    let table;
+    let table, committedFreeBytes;
     if (process.platform === "win32") {
       const text = await runCapture("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize | ConvertTo-Json -Compress"]);
-      table = [JSON.parse(text)].flat().map((item) => ({ pid: Number(item.ProcessId), parent: Number(item.ParentProcessId), bytes: Number(item.WorkingSetSize) }));
+        "$clipMemory = Get-CimInstance Win32_OperatingSystem; @{ processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CreationDate); commitFree = [double]$clipMemory.FreeVirtualMemory * 1024 } | ConvertTo-Json -Depth 4 -Compress"]);
+      const sample = JSON.parse(text);
+      committedFreeBytes = Number(sample.commitFree) > 0 ? Number(sample.commitFree) : undefined;
+      table = sample.processes.map((item) => ({ pid: Number(item.ProcessId), parent: Number(item.ParentProcessId), bytes: Number(item.WorkingSetSize), born: String(item.CreationDate) }));
     } else {
       const text = await runCapture("ps", ["-eo", "pid=,ppid=,rss="]);
       table = text.trim().split(/\r?\n/).map((line) => {
@@ -425,56 +422,155 @@ async function workerRss(pids) {
         return { pid, parent, bytes: rss * 1024 };
       });
     }
-    const selected = new Set(pids);
-    for (let iteration = 0; iteration < table.length; iteration++) {
-      let changed = false;
-      for (const entry of table) if (selected.has(entry.parent) && !selected.has(entry.pid)) {
-        selected.add(entry.pid);
-        changed = true;
+    const measured = new Map();
+    for (const [id, reservation] of active) {
+      const child = reservation.child;
+      if (!child?.pid) continue;
+      const selected = new Set([child.pid]);
+      for (let iteration = 0; iteration < table.length; iteration++) {
+        let changed = false;
+        for (const entry of table) if (selected.has(entry.parent) && !selected.has(entry.pid)) {
+          selected.add(entry.pid); changed = true;
+        }
+        if (!changed) break;
       }
-      if (!changed) break;
+      child.descendants ??= new Map();
+      for (const entry of table) if (selected.has(entry.pid) && entry.pid !== child.pid) child.descendants.set(entry.pid, entry.born);
+      measured.set(id, table.filter((entry) => selected.has(entry.pid)).reduce((sum, entry) => sum + (entry.bytes || 0), 0));
     }
-    return table.filter((entry) => selected.has(entry.pid)).reduce((sum, entry) => sum + (entry.bytes || 0), 0);
-  } catch { return 0; }
+    return { measured, committedFreeBytes, known: true };
+  } catch { return { measured: new Map(), known: false }; }
 }
 
 async function killTree(child) {
   if (!child.pid) return;
   if (process.platform === "win32") {
-    await runCapture("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"]).catch(() => undefined);
-  } else child.kill("SIGTERM");
+    await runCapture("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], 2000, true).catch(() => undefined);
+    if (child.descendants?.size) {
+      // A renderer can exit before its Chrome children. Check creation identity
+      // before terminating any orphan; never kill a PID reused by another app.
+      const text = await runCapture("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+        "@(Get-CimInstance Win32_Process | Select-Object ProcessId,CreationDate) | ConvertTo-Json -Compress"], 2_000_000, true).catch(() => "[]");
+      let current = [];
+      try { current = [JSON.parse(text || "[]")].flat(); } catch { /* Do not substitute cleanup parsing for the real render error. */ }
+      for (const item of current) if (child.descendants.get(Number(item.ProcessId)) === String(item.CreationDate))
+        await runCapture("taskkill.exe", ["/PID", String(item.ProcessId), "/T", "/F"], 2000, true).catch(() => undefined);
+    }
+  } else {
+    try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); }
+  }
 }
 
-async function renderOnce(context, row, temporary, gpu, logFile) {
+async function renderOnce(context, row, temporary, gpu, logFile, reservation) {
   const { settings, project } = context;
-  const args = [hyperframesCli, "render", project, "--composition", path.relative(project, row.composition),
+  let prepared;
+  try { prepared = await prepareRenderComposition(row, project); }
+  catch (error) { error.failure = { stage: "prepare", kind: "resource-file", retryable: false, cause: publicError(error.message) }; throw error; }
+  const args = [context.runtimeCli ?? hyperframesCli, "render", project, "--composition", path.relative(project, prepared.file),
     "--output", temporary, "--format", "mp4", "--quality", settings.quality ?? "high",
     "--fps", String(settings.fps ?? 30), "--workers", "1"];
   if (settings.resolution) args.push("--resolution", settings.resolution);
   if (settings.crf !== undefined) args.push("--crf", String(settings.crf));
   if (gpu) args.push("--gpu");
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { cwd: project, windowsHide: true, shell: false });
+  try { await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, { cwd: project, windowsHide: true, shell: false,
+      detached: process.platform !== "win32", env: { ...process.env, CLIP_RENDER_QUEUE: "1",
+        CLIP_RENDER_EXTRACT_WORKERS: String(reservation.extractWorkers), CLIP_RENDER_EXTRACT_THREADS: String(reservation.extractThreads),
+        HF_VIDEO_EXTRACTION_MAX_RETRIES: "0",
+        ...(reservation.captureFallback ? { PRODUCER_FORCE_SCREENSHOT: "true", PRODUCER_EXPERIMENTAL_FAST_CAPTURE: "false" } : {}) } });
+    reservation.child = child;
     children.add(child);
-    let tail = "";
+    const stop = () => { void killTree(child); };
+    context.signal.addEventListener("abort", stop, { once: true });
+    if (context.signal.aborted) stop();
+    let tail = "", lineBuffer = "", logBytes = 0, writeChain = Promise.resolve();
+    const sources = [];
     const append = (chunk) => {
       const text = chunk.toString("utf8");
-      tail = (tail + text).slice(-4_000);
-      void fs.appendFile(logFile, text).catch(() => undefined);
+      tail = (tail + text).slice(-32_000);
+      lineBuffer += text;
+      const lines = lineBuffer.split(/\r?\n/); lineBuffer = lines.pop().slice(-32_000);
+      for (const line of lines) { const detail = sourceDiagnostic(line); if (detail && sources.length < 20) sources.push(detail); }
+      if (logBytes < 8 * MiB) {
+        const safe = publicError(text, 32_000, true); logBytes += Buffer.byteLength(safe);
+        writeChain = writeChain.then(() => fs.appendFile(logFile, `${safe}\n`)).catch(() => undefined);
+      }
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
-    child.on("error", (error) => { children.delete(child); reject(new Error(`HyperFrames 启动失败：${error.message}`)); });
-    child.on("close", (code) => {
-      children.delete(child);
-      code === 0 && !interrupted ? resolve() : reject(new Error(`HyperFrames 退出码 ${code ?? "未知"}：${tail.trim() || "未提供详细原因"}`));
+    child.on("error", (error) => { children.delete(child); reject(new Error(`HyperFrames 启动失败：${error.message}`, { cause: error })); });
+    child.on("close", async (code) => {
+      try {
+      const stopped = interrupted || context.signal.aborted;
+      if (code !== 0 || stopped) await killTree(child);
+      const finalDetail = sourceDiagnostic(lineBuffer); if (finalDetail && sources.length < 20) sources.push(finalDetail);
+      await writeChain;
+      if (code === 0 && !stopped) resolve();
+      else {
+        const failure = stopped ? { stage: "stop", kind: "aborted", retryable: false, cause: "渲染已停止" }
+          : classifyRenderFailure(tail, sources, code);
+        const error = new Error(`HyperFrames 退出码 ${code ?? "未知"}：${failure.cause}`);
+        error.failure = failure; reject(error);
+      }
+      } catch (error) { reject(error); }
+      finally { children.delete(child); context.signal.removeEventListener("abort", stop); }
     });
-  });
+  }); await prepared.verify(); } finally { await prepared.dispose(); }
 }
 
-async function runQueue(options) {
+async function recoveryState(context) {
+  const task = await readText(path.join(context.workspace, "..", "task.json")).then(JSON.parse).catch(absentPath);
+  if (task && task.id !== context.contract.taskId) throw new Error("渲染恢复记录的任务身份不符");
+  const attempt = task?.attemptStartedAt ?? task?.startedAt ?? "legacy";
+  const file = path.join(context.deliveryDir, "render-recovery.json");
+  const stat = await readLinkStat(file).catch(absentPath);
+  if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw new Error("渲染恢复记录不是普通文件");
+  const saved = stat && JSON.parse(await readText(file));
+  if (saved && (saved.version !== 1 || saved.taskId !== context.contract.taskId || !saved.rows || typeof saved.rows !== "object"))
+    throw new Error("渲染恢复记录损坏，未重置自动恢复额度");
+  const state = saved?.attempt === attempt ? saved : { version: 1, taskId: context.contract.taskId, attempt, rows: {} };
+  let chain = Promise.resolve();
+  return { state, save: () => { const snapshot = structuredClone(state); chain = chain.then(() => writeManifest(file, snapshot)); return chain; } };
+}
+
+async function queueLock(context) {
+  const file = path.join(context.deliveryDir, "render-queue.lock");
+  try {
+    const lock = await fs.open(file, "wx");
+    try { await lock.writeFile(JSON.stringify({ pid: process.pid, taskId: context.contract.taskId })); }
+    finally { await lock.close(); }
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    const stat = await readLinkStat(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("渲染锁不是普通文件");
+    const saved = JSON.parse(await readText(file));
+    if (!Number.isInteger(saved.pid) || saved.pid <= 0 || saved.taskId !== context.contract.taskId) throw new Error("渲染锁身份无效");
+    try { process.kill(saved.pid, 0); throw new Error("当前任务的渲染队列仍在运行，不重复启动"); }
+    catch (cause) { if (cause.code !== "ESRCH") throw cause; }
+    await fs.rm(file); return queueLock(context);
+  }
+  return () => fs.rm(file, { force: true });
+}
+
+/** Offline test hooks never enter the CLI protocol. */
+export async function runQueue(options, hooks = {}) {
   const context = await validatedManifest(options);
+  context.runtimeCli = hooks.runtimeCli;
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  hooks.signal?.addEventListener("abort", stop, { once: true });
+  if (hooks.signal?.aborted) stop();
+  context.signal = controller.signal;
+  context.cancel = stop;
+  const unlock = await queueLock(context);
+  try { return await executeQueue(context, hooks); }
+  finally { hooks.signal?.removeEventListener("abort", stop); await unlock(); }
+}
+
+async function executeQueue(context, hooks) {
   const { manifest, manifestPath, workspace, rows } = context;
+  const stopped = () => interrupted || context.signal.aborted;
+  const recovery = await recoveryState(context);
   const logsDir = path.join(workspace, "render-logs");
   await fs.mkdir(logsDir, { recursive: true });
   let saveChain = Promise.resolve();
@@ -489,93 +585,111 @@ async function runQueue(options) {
     const existing = await readStat(row.output).catch(absentPath);
     if (existing) {
       const receipt = await readReceipt(context, row);
-      if (!receipt) {
-        throw new Error(`第 ${row.index + 1} 条交付位置已有未知文件，未覆盖该文件`);
-      }
+      if (!receipt) throw new Error(`第 ${row.index + 1} 条交付位置已有未知文件，未覆盖该文件`);
       try {
         const verified = await verifyVideo(row.output, row.audio, context.settings.fps ?? 30);
-        if (receipt && (receipt.bytes !== verified.bytes || receipt.sha256 !== await sha256(row.output))) {
+        if (receipt.bytes !== verified.bytes || receipt.sha256 !== await sha256(row.output))
           throw new Error("完成凭据与当前成片内容不符");
-        }
-        entry.status = "completed";
-        entry.verified = verified;
-        continue;
-      } catch (error) {
-        throw new Error(`第 ${row.index + 1} 条已有文件无法验证，未覆盖：${error.message}`);
-      }
+        entry.status = "completed"; entry.verified = verified; continue;
+      } catch (error) { throw new Error(`第 ${row.index + 1} 条已有文件无法验证，未覆盖：${error.message}`); }
     }
-    entry.status = "pending";
-    pending.push(row);
+    entry.status = "pending"; pending.push(row);
   }
   await save();
-  const failures = [];
-  const active = new Map();
-  let lastCpu = cpuSnapshot();
-  let observedWorkerBytes = 0;
-  async function runRow(row) {
+  const failures = [], active = new Map(), reservations = new Map();
+  let lastCpu = cpuSnapshot(), observedWorkerBytes = 0, pressure = false;
+  const sample = hooks.sample ?? workerResources, render = hooks.render ?? renderOnce;
+  async function runRow(row, reservation) {
     const entry = manifest.rows[row.index];
-    entry.status = "running";
-    entry.error = undefined;
-    await save();
     const temporary = path.join(path.dirname(row.output), `.clip-studio-${row.index + 1}-${randomUUID()}.mp4`);
-    const logFile = path.join(logsDir, `render-${row.index + 1}.log`);
-    let hardwareError;
+    const logFile = path.join(logsDir, `render-${row.index + 1}-${String(recovery.state.attempt).replace(/[^\da-z]/gi, "_")}.log`);
+    let record = recovery.state.rows[row.index];
+    if (!record || record.signature !== row.rowSignature)
+      record = recovery.state.rows[row.index] = { signature: row.rowSignature, attempts: 0 };
     try {
-      try {
-        await renderOnce(context, row, temporary, true, logFile);
-        entry.route = "gpu-requested";
-      } catch (error) {
-        if (interrupted) throw error;
-        if (!isHardwareFailure(error.message)) throw error;
-        hardwareError = error;
-        await fs.rm(temporary, { force: true });
-        await renderOnce(context, row, temporary, false, logFile);
-        entry.route = "software-fallback";
-        entry.fallbackReason = publicError(hardwareError.message);
+      if (record.attempts >= 2 || (record.attempts && record.failure?.retryable === false)) {
+        const error = new Error(`[RENDER_EXHAUSTED] 本次执行已处理过相同工程，自动恢复额度已用完：${record.failure?.cause ?? "上次执行被中断"}。请修正真实错误，或点击原任务“重试 / 继续制作”；已完成成片保持不变。`);
+        error.failure = { stage: record.failure?.stage ?? "render", kind: "exhausted", cause: error.message, retryable: false };
+        throw error;
       }
+      const previous = record.failure;
+      record.attempts++; record.failure = undefined;
+      // Durable before spawn; editing manifest status cannot reset the budget.
+      await recovery.save();
+      entry.status = "running"; entry.error = undefined; await save();
+      const hardware = previous?.kind !== "hardware";
+      reservation.captureFallback = previous?.stage === "capture";
+      await render(context, row, temporary, hardware, logFile, reservation);
+      entry.route = hardware ? "gpu-requested" : "software-fallback";
+      if (previous) entry.fallbackReason = publicError(previous.cause);
+      if (stopped()) throw new Error("渲染已停止");
       await assertInputsUnchanged(row);
       const verified = await verifyVideo(temporary, row.audio, context.settings.fps ?? 30);
-      // Receipt is durable first; the reserved filename appears only after an
-      // atomic rename. A crash in either gap never promotes an unknown file.
+      if (stopped()) throw new Error("渲染已停止，未发布最终文件");
       await publishReceipt(context, row, verified, temporary);
+      if (stopped()) throw new Error("渲染已停止，未发布最终文件");
       await fs.rename(temporary, row.output);
-      entry.status = "completed";
-      entry.verified = verified;
-      entry.error = undefined;
+      entry.status = "completed"; entry.verified = verified; entry.error = undefined;
       process.stdout.write(`完成 ${row.index + 1}/${rows.length}: ${row.output}\n`);
     } catch (error) {
-      const message = hardwareError && hardwareError !== error
-        ? `硬件路径：${hardwareError.message}；软件路径：${error.message}` : error.message;
-      entry.status = "failed";
-      entry.error = publicError(message);
-      failures.push(`第 ${row.index + 1} 条：${entry.error}`);
-      process.stderr.write(`${failures.at(-1)}\n`);
+      const failure = stopped() ? { stage: "stop", kind: "aborted", retryable: false, cause: "渲染已停止" }
+        : error.failure ?? { stage: "verify/publish", kind: "verification", retryable: false, cause: publicError(error.message) };
+      record.failure = failure;
+      entry.error = rowFailureMessage(row.index, failure, path.relative(workspace, logFile), record.attempts);
+      await fs.writeFile(path.join(logsDir, `failure-${row.index + 1}.json`), JSON.stringify({
+        version: 1, row: row.index + 1, attempt: recovery.state.attempt, attempts: record.attempts,
+        ...failure, log: path.relative(workspace, logFile),
+      }) + "\n");
+      if (!stopped() && failure.retryable && record.attempts < 2) {
+        entry.status = "pending"; row.recovery = true; pending.unshift(row); pressure = true;
+        process.stderr.write(`${entry.error}；等待其他渲染退出后低负载恢复一次\n`);
+      } else { entry.status = "failed"; failures.push(entry.error); process.stderr.write(`${entry.error}\n`); }
     } finally {
       await fs.rm(temporary, { force: true });
-      await save();
+      await recovery.save(); await save();
     }
   }
-  while ((pending.length || active.size) && !interrupted) {
-    const currentCpu = cpuSnapshot();
-    const load = cpuBusy(lastCpu, currentCpu);
-    lastCpu = currentCpu;
-    const rss = await workerRss([...children].map((child) => child.pid).filter(Boolean));
-    if (rss && active.size) observedWorkerBytes = Math.max(observedWorkerBytes, rss / active.size);
-    while (pending.length && shouldAdmit({
-      active: active.size, logicalCpus: os.availableParallelism(), cpuBusy: load,
-      freeBytes: os.freemem(), totalBytes: os.totalmem(), observedWorkerBytes,
-    }) && !interrupted) {
-      const row = pending.shift();
-      const promise = runRow(row).finally(() => active.delete(row.index));
-      active.set(row.index, promise);
-      if (active.size === 1) break; // observe the first real worker before admitting more
+  try {
+    while ((pending.length || active.size) && !stopped()) {
+      const currentCpu = cpuSnapshot(), load = cpuBusy(lastCpu, currentCpu); lastCpu = currentCpu;
+      const usage = await sample(reservations);
+      for (const [id, bytes] of usage.measured) {
+        observedWorkerBytes = Math.max(observedWorkerBytes, bytes);
+        const reservation = reservations.get(id);
+        if (reservation) reservation.bytes = Math.max(reservation.bytes, bytes * 1.3);
+      }
+      const budget = admissionBudget({
+        active: active.size, logicalCpus: os.availableParallelism(), cpuBusy: load,
+        freeBytes: os.freemem(), totalBytes: os.totalmem(), observedWorkerBytes,
+        estimatedWorkerBytes: pending[0]?.estimatedWorkerBytes ?? 0, ...usage,
+        reservations: [...reservations].map(([id, value]) => ({ id, bytes: value.bytes })),
+      });
+      const warming = [...reservations.keys()].some((id) => !(usage.measured.get(id) > 0));
+      const singleOnly = [...reservations.values()].some((reservation) => reservation.lowLoad);
+      if (pending.length && budget.admit && (!active.size || (!pressure && !warming && !singleOnly)) && !stopped()) {
+        const row = pending.shift();
+        const reservation = {
+          bytes: budget.cost, extractWorkers: row.recovery ? 1 : budget.extractWorkers,
+          extractThreads: row.recovery ? 1 : budget.extractThreads,
+          lowLoad: row.recovery || budget.lowLoad,
+        };
+        // Reserve synchronously BEFORE runRow reaches any await.
+        reservations.set(row.index, reservation);
+        const promise = runRow(row, reservation).finally(() => { reservations.delete(row.index); active.delete(row.index); });
+        active.set(row.index, promise);
+        if (!row.recovery) pressure = false;
+      }
+      if (!pending.length && active.size) await Promise.race(active.values());
+      else if (active.size) await Promise.race([new Promise((resolve) => setTimeout(resolve, hooks.pollMs ?? 3_000)), ...active.values()]);
     }
-    if (!pending.length && active.size) await Promise.race(active.values());
-    else if (active.size) await Promise.race([new Promise((resolve) => setTimeout(resolve, 3_000)), ...active.values()]);
+  } catch (error) {
+    context.cancel();
+    await Promise.allSettled([...reservations.values()].flatMap((row) => row.child ? [killTree(row.child)] : []));
+    await Promise.allSettled(active.values()); throw error;
   }
   await Promise.allSettled(active.values());
-  if (interrupted) throw new Error("渲染已停止，已验证成片保持不变");
-  if (failures.length) throw new Error(failures.join("；"));
+  if (stopped()) throw new Error("渲染已停止，已验证成片保持不变");
+  if (failures.length) throw new Error(`[RENDER_EXHAUSTED] ${failures.join("；")}`);
   return { completed: manifest.rows.filter((entry) => entry.status === "completed").length, total: rows.length, manifest: manifestPath };
 }
 
@@ -594,7 +708,7 @@ function parseArgs(argv) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
     interrupted = true;
-    for (const child of children) void killTree(child);
+    for (const child of [...children]) void killTree(child);
   });
   try {
     const argv = process.argv.slice(2);

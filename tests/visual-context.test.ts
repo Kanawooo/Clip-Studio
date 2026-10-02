@@ -96,6 +96,32 @@ test("native OpenAI conversion proves reduction only after validated exclusions,
   assert.ok(wire(projected).length < wire(messages).length * 0.1);
 });
 
+test("15 selected pages leave only finalized proven engineering; reread, pending decisions and stale proofs restore images",async()=>{
+  const records=Array.from({length:15},(_,i)=>({...evidence,path:path.join(workspace,`chosen-${i}.jpg`),sourceKey:`chosen-${i}`}));
+  const final={...proof,finalized:true,excluded:[],active:records,required:records};
+  const messages:Messages=[assistant(0,records.map((record,i)=>tool(`chosen-${i}`,"read",{path:record.path}))),
+    ...records.map((_,i)=>image(`chosen-${i}`)),history()[2]!,saved(final)];
+  const projectReady=(values=messages,ready:VisualProof|undefined=final)=>projectVisualContext(values,records,script,workspace,[final],[],values,ready);
+  assert.equal(count(projectVisualContext(messages,records,script,workspace,[final])),15);
+  const projected=projectReady();assert.equal(count(projected),0);
+  const model={id:"fixture",provider:"fixture",api:"openai-completions",input:["text","image"]};
+  const wire=(values:Messages)=>JSON.stringify(convertMessages(model,{messages:convertToLlm(values)},{}));
+  assert.ok(wire(projected).length<wire(messages).length*0.1);
+  assert.equal(count(projectReady(messages,{...final,sha256:"b".repeat(64)})),15);
+  const again=[...messages,assistant(500,[tool("detail-again","read",{path:records[0]!.path})]),image("detail-again",600)];
+  assert.equal(count(projectReady(again)),2,"all instances of explicitly reread page reach next request");
+  const pending=[...messages,assistant(500,[tool("pending-decision","write",{path:"selections/new.json",content:"unverified"})]),
+    {role:"toolResult",toolName:"write",toolCallId:"pending-decision",timestamp:time+600,isError:true,content:[{type:"text",text:"failed"}]} as Messages[number]];
+  assert.equal(count(projectReady(pending)),15);
+  const entries=messages.map((message,i)=>({type:"message",id:String(i),message}));
+  const ctx={sessionManager:{getBranch:()=>entries},abort:()=>{}} as unknown as ExtensionContext;
+  const runtime=createVisualRuntime({workspace,projectRoot:path.resolve("."),isEngineeringReady:(_ctx,value)=>value.sha256===final.sha256},async()=>({images:records,proofs:[final]}));
+  assert.equal(count((await runtime.context({type:"context",messages:JSON.parse(JSON.stringify(messages))},ctx))!.messages),0);
+  const event={reason:"threshold",branchEntries:entries,preparation:{messagesToSummarize:messages,turnPrefixMessages:[]}} as unknown as SessionBeforeCompactEvent;
+  assert.equal(await runtime.beforeCompact(event,ctx),undefined);
+  assert.equal(count(messages),15,"native history remains unchanged");
+});
+
 for (const length of [1, 2, 3, 4, 5, 27]) test(`capacity grouping uses up to four new images for ${length} paths`, () => {
   const images = Array.from({ length }, (_, i) => ({ ...evidence, path: `${i}.jpg` }));
   const result = groupImages(images, { requestBytes: 1000, historyImages: 0 });

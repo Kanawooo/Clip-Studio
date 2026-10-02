@@ -43,6 +43,7 @@ for (const relative of [
   "scripts/download-runtime.ps1",
   "scripts/dpapi-secret.ps1",
   "scripts/patch-puppeteer-windows.mjs",
+  "scripts/hyperframes-render-patch.mjs",
   "scripts/prewarm-whisper.mjs",
   "scripts/run-service.mjs",
   "scripts/runtime-manifest.psd1",

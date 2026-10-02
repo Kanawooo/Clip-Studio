@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { patchRenderSource } from "./hyperframes-render-patch.mjs";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const packageRoot = path.join(projectRoot, "node_modules", "@puppeteer", "browsers");
@@ -13,6 +14,7 @@ const hyperFramesCliPath = path.join(hyperFramesRoot, "dist", "cli.js");
 const expectedHyperFramesVersion = "0.8.4";
 const modelDirBefore = 'MODELS_DIR = join21(homedir5(), ".cache", "hyperframes", "whisper", "models");';
 const modelDirAfter = 'MODELS_DIR = process.env["HYPERFRAMES_WHISPER_MODELS_DIR"] || join21(homedir5(), ".cache", "hyperframes", "whisper", "models");';
+const changes = [];
 
 let packageJson;
 try {
@@ -32,7 +34,7 @@ for (const relativePath of [path.join("lib", "launch.js"), path.join("src", "lau
   if (occurrences !== 1 || !source.includes("windowsHide: true")) {
     throw new Error(`Refusing to patch unexpected @puppeteer/browsers file: ${relativePath}`);
   }
-  await writeFile(filePath, source.replace(before, after), "utf8");
+  changes.push({ filePath, source: source.replace(before, after) });
 }
 
 let hyperFramesPackage;
@@ -45,12 +47,16 @@ if (hyperFramesPackage.version !== expectedHyperFramesVersion) {
   throw new Error(`Unsupported HyperFrames version ${String(hyperFramesPackage.version)}; expected ${expectedHyperFramesVersion}`);
 }
 const hyperFramesCli = await readFile(hyperFramesCliPath, "utf8");
-if (!hyperFramesCli.includes(modelDirAfter)) {
-  const occurrences = hyperFramesCli.split(modelDirBefore).length - 1;
+let patchedCli = patchRenderSource(hyperFramesCli, hyperFramesPackage.version);
+if (!patchedCli.includes(modelDirAfter)) {
+  const occurrences = patchedCli.split(modelDirBefore).length - 1;
   if (occurrences !== 1) {
     throw new Error("Refusing to patch an unexpected HyperFrames model directory implementation");
   }
-  await writeFile(hyperFramesCliPath, hyperFramesCli.replace(modelDirBefore, modelDirAfter), "utf8");
+  patchedCli = patchedCli.replace(modelDirBefore, modelDirAfter);
 }
+if (patchedCli !== hyperFramesCli) changes.push({ filePath: hyperFramesCliPath, source: patchedCli });
+// Validate EVERY version/signature before the first dependency write.
+for (const { filePath, source } of changes) await writeFile(filePath, source, "utf8");
 
 console.log("[postinstall] Clip Studio Windows rendering and transcription paths are configured.");

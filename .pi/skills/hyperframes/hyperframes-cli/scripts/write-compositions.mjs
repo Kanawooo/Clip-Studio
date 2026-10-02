@@ -6,6 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { mediaAccess, taskInput, taskOutput } from "../../../clip-skills/scripts/media-cache.mjs";
 import { attribute, publicError, validateAudio } from "./render-queue.mjs";
+import { localizeGsap } from "./render-resources.mjs";
 
 const inside = (root, file) => {
   const relative = path.relative(root, file);
@@ -90,6 +91,8 @@ export async function writeCompositions(options) {
       await checkMedia(html, project, access);
       await validateAudio(row, file, project, contract, fps, html);
       const existing = await fs.readFile(file, "utf8").catch((error) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+      // Legacy identical adoption keeps its original engineering digest.
+      if (existing !== html) html = await localizeGsap(html, project);
       if (existing !== undefined && existing !== html) throw new Error("已有工程内容不同，未覆盖；请用原生 edit 修正或选择新 composition 文件名");
       prepared.push({ index, file, html, existing: existing !== undefined });
     } catch (error) { throw new Error(`rows[${index}]：${publicError(error.message)}`); }

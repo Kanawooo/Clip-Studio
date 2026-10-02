@@ -136,7 +136,8 @@ export class TaskManager {
         const content = Array.isArray(event.result?.content) ? event.result.content : [];
         const detail = content.filter((item: { type?: string; text?: string }) => item.type === "text")
           .map((item: { text?: string }) => item.text ?? "").join(" ").trim();
-        lastToolFailure = `${event.toolName} 执行失败${detail ? `：${detail.slice(-1_500)}` : "（工具未提供详细原因）"}`;
+        const canonical = detail.match(/render-queue:\s*([^\r\n]*)/g)?.at(-1)?.replace(/^render-queue:\s*/, "");
+        lastToolFailure = `${event.toolName} 执行失败${detail ? `：${(canonical ?? detail).slice(0, 1_500)}` : "（工具未提供详细原因）"}`;
       });
       return {
         prompt: async (text) => {
@@ -145,13 +146,13 @@ export class TaskManager {
           } catch (error) {
             const policyFailure = pi.getFailure();
             if (policyFailure) throw new Error(policyFailure, { cause: error });
-            throw error;
+            throw new Error(pi.describeFailure(error instanceof Error ? error.message : String(error)), { cause: error });
           }
           const policyFailure = pi.getFailure();
           if (policyFailure) throw new Error(policyFailure);
           const lastAssistant = [...pi.session.messages].reverse().find((message) => message.role === "assistant");
           if (lastAssistant?.stopReason === "error") {
-            throw new Error(lastAssistant.errorMessage || "Pi 模型请求失败");
+            throw new Error(pi.describeFailure(lastAssistant.errorMessage || "Pi 模型请求失败"));
           }
         },
         abort: () => pi.session.abort(),

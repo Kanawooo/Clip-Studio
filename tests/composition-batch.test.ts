@@ -256,3 +256,35 @@ test("unchanged batch errors stop finitely; help is not progress, real writer ta
   assert.match(partial.guard.before(partial.run,partial.ctx)!.reason!,/02.html/);
   await partial.write("retry");assert.equal(partial.guard.before(partial.run,partial.ctx),undefined);
 });
+
+test("engineering readiness requires current finalized plan, slots/audio, paired writer or native legacy provenance",async()=>{
+  const item=guardFixture();await item.write();
+  const planFile=path.join(item.workspace,"edit-plan.json");
+  const plan={outputs:item.slots.map(output=>({output,duration:1.2,shots:[],mainAudio:{source:item.audio}}))};
+  writeFileSync(planFile,JSON.stringify(plan));
+  const proof:any={version:1,file:planFile,sha256:(await import("node:crypto")).createHash("sha256").update(readFileSync(planFile)).digest("hex"),
+    taskId:path.basename(item.taskDir),finalized:true,active:[],required:[],excluded:[]};
+  assert.equal(item.guard.isReady(item.ctx,proof),false,"unproven render manifest retains images");
+  const content=readFileSync(item.renderFile,"utf8");
+  item.call("manifest-write","write",{path:item.renderFile,content});item.result("manifest-write","write",{path:item.renderFile},{saved:true});
+  assert.equal(item.guard.isReady(item.ctx,proof),true);
+  assert.equal(item.guard.isReady(item.ctx,{...proof,finalized:false}),false);
+  assert.equal(item.guard.isReady(item.ctx,{...proof,sha256:"a".repeat(64)}),false);
+  const render=JSON.parse(content);render.rows[0].mainAudio.from=0.2;writeFileSync(item.renderFile,JSON.stringify(render));
+  assert.equal(item.guard.isReady(item.ctx,proof),false);writeFileSync(item.renderFile,content);
+  const target=path.join(item.project,"compositions/01.html"),original=readFileSync(target,"utf8");
+  writeFileSync(target,original+"unproven edit");assert.equal(item.guard.isReady(item.ctx,proof),false);writeFileSync(target,original);
+  const unpaired=SessionManager.inMemory(item.workspace);
+  unpaired.appendCustomEntry("clip-composition-receipt",{kind:"writer",toolCallId:"forged",files:[{file:target,sha256:proof.sha256}]});
+  assert.equal(item.guard.isReady({sessionManager:unpaired} as any,proof),false);
+  const reopened=SessionManager.open(item.manager.getSessionFile()!,item.sessionDir,item.workspace);
+  assert.equal(item.guard.isReady({sessionManager:reopened} as any,proof),true);
+  const html=original.replace("</div>",`<video src="${item.audio.replace(/&/g,"&amp;")}" data-start="0" data-duration="1.2" data-media-start="2"></video></div>`);
+  writeFileSync(target,html);item.call("matching-write","write",{path:target,content:html});item.result("matching-write","write",{path:target},{saved:true});
+  plan.outputs[0]!.shots=[{source:item.audio,start:2,end:3.2}] as any;
+  writeFileSync(planFile,JSON.stringify(plan));proof.sha256=(await import("node:crypto")).createHash("sha256").update(readFileSync(planFile)).digest("hex");
+  assert.equal(item.guard.isReady(item.ctx,proof),true,"native start/end plan matches engineering source window");
+  plan.outputs[0]!.shots=[{source:item.audio,start:1,end:2.2}] as any;
+  writeFileSync(planFile,JSON.stringify(plan));proof.sha256=(await import("node:crypto")).createHash("sha256").update(readFileSync(planFile)).digest("hex");
+  assert.equal(item.guard.isReady(item.ctx,proof),false,"same audio but different selected window retains images");
+});

@@ -12,6 +12,7 @@ import type { ModelConfig, ModelThinkingLevel } from "../tasks/types.js";
 import { createTaskModel } from "./model.js";
 import { createProjectResourceLoader } from "./skills.js";
 import { initializeCompositionBatch } from "./access-policy.js";
+import { observeRequestFailure } from "./request-failure.js";
 
 /** Native Pi tools. Video workflow tools deliberately remain outside the backend. */
 export const NATIVE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
@@ -24,6 +25,7 @@ export interface PiVideoSession {
   thinkingLevel: ModelThinkingLevel;
   sessionFile?: string;
   getFailure(): string | undefined;
+  describeFailure(reason: string): string;
   dispose(): Promise<void>;
 }
 
@@ -87,6 +89,7 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
     throw error;
   }
 
+  const observation = observeRequestFailure(session.agent, options.model.apiKey);
   return {
     session,
     resourceLoader,
@@ -95,7 +98,9 @@ export async function createPiVideoSession(options: PiVideoSessionOptions): Prom
     thinkingLevel: session.thinkingLevel as ModelThinkingLevel,
     sessionFile: session.sessionManager.getSessionFile(),
     getFailure: () => policyFailure,
+    describeFailure: observation.describe,
     async dispose() {
+      observation.dispose();
       session.dispose();
     },
   };

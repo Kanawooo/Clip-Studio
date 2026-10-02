@@ -14,6 +14,12 @@ to their own licenses.
 The `talking-head-recut` skill contains adapted MIT-licensed material and keeps
 its attribution in `.pi/skills/hyperframes/talking-head-recut/NOTICE.md`.
 
+The local render resource GSAP 3.14.2 is copied from the official GreenSock
+repository's fixed `3.14.2` tag. Its copyright notice is retained in the file;
+it is governed by the [GSAP Standard License](https://gsap.com/standard-license/),
+not the project's MIT license. Source URL and SHA-256 are recorded alongside
+the resource in `.pi/skills/hyperframes/hyperframes-cli/resources/gsap-3.14.2.json`.
+
 ## npm runtime dependencies
 
 | Component | Pinned version | License/source |

@@ -110,7 +110,8 @@ function mediaAction(command: unknown, script: string): string | undefined {
 /** Request-only projection; native transcript/image files are immutable.
  * Proofs must be revalidated against the current task file by the CLI reader. */
 export function projectVisualContext(messages: Messages, evidence: VisualEvidence[], mediaScript: string,
-  workspace = process.cwd(), verified: VisualProof[] = [], selections: SelectionProof[] = [], trustedHistory: Messages = messages): Messages {
+  workspace = process.cwd(), verified: VisualProof[] = [], selections: SelectionProof[] = [], trustedHistory: Messages = messages,
+  engineeringReady?: VisualProof): Messages {
   const history = nativeHistory(trustedHistory, mediaScript, workspace);
   const byPath = new Map(evidence.map((image) => [key(image.path), image]));
   const latestRead = new Map<string, number>();
@@ -137,11 +138,18 @@ export function projectVisualContext(messages: Messages, evidence: VisualEvidenc
   const seenBefore = (image: VisualEvidence) => history.imageReads.some((read) => read.index < native.callIndex
     && latestRead.get(key(read.file))! < native.callIndex && sameImage(byPath.get(key(read.file)), image));
   const active = new Set(proof.active.map((item) => key(item.path)));
-  for (const read of history.imageReads) if (active.has(key(read.file))) authorized.delete(read.id);
-  const finalized = proof.finalized && proof.required.length > 0 && proof.required.every(seenBefore);
+  const finalized = proof.finalized && proof.required.length > 0 && proof.required.every((image) =>
+    history.imageReads.some((read) => read.index < native.callIndex && sameImage(byPath.get(key(read.file)), image)));
+  const pendingDecision = [...history.latestSelectionWrite.values()].some((id) =>
+    !history.selections.some((batch) => trustedHistory[batch.index]?.role === "toolResult"
+      && (trustedHistory[batch.index] as { toolCallId: string }).toolCallId === id)
+    || trustedHistory.findIndex((message) => message.role === "toolResult" && message.toolCallId === id) > native.index);
+  const ready = finalized && !pendingDecision && engineeringReady?.sha256 === proof.sha256
+    && engineeringReady.taskId === proof.taskId && key(engineeringReady.file) === key(proof.file);
+  for (const read of history.imageReads) if (active.has(key(read.file)) && !ready) authorized.delete(read.id);
   for (const read of history.imageReads) {
     const image = byPath.get(key(read.file));
-    if (!image || read.index >= native.callIndex || latestRead.get(key(read.file))! >= native.callIndex || active.has(key(read.file))) continue;
+    if (!image || read.index >= native.callIndex || latestRead.get(key(read.file))! >= native.callIndex || (active.has(key(read.file)) && !ready)) continue;
     const excluded = image.role !== "reference" && proof.excluded.some((item) => sameImage(item, image)) && seenBefore(image);
     if (excluded || finalized) authorized.set(read.id, { image, decision: finalized ? "plan-finalized" : "excluded" });
   }
@@ -233,7 +241,8 @@ export function measurePayload(payload: unknown) {
   return { images, imageBytes, maxMessageImages, requestBytes: bytes(payload), measurement: "serialized native payload" };
 }
 
-export function createVisualRuntime(options: { workspace: string; projectRoot: string; onTermination?: (reason: string) => void }, reader?: StateReader) {
+export function createVisualRuntime(options: { workspace: string; projectRoot: string; onTermination?: (reason: string) => void;
+  isEngineeringReady?: (ctx: ExtensionContext, proof: VisualProof) => boolean }, reader?: StateReader) {
   const script = path.join(options.projectRoot, ".pi", "skills", "clip-skills", "scripts", "media-cache.mjs");
   let nativeReader: StateReader | undefined, load: Promise<unknown> | undefined;
   let latest: Messages = [], state: VisualState = { images: [], proofs: [] }, systemBytes = 64 * 1024;
@@ -253,7 +262,9 @@ export function createVisualRuntime(options: { workspace: string; projectRoot: s
       const history = nativeHistory(trusted, script, options.workspace);
       state = await loadState([...new Set(history.imageReads.map((read) => read.file))], history.proofs.slice(-1).map((row) => row.proof),
         history.selections.map((row) => row.proof));
-      latest = projectVisualContext(event.messages, state.images, script, options.workspace, state.proofs, state.selections, trusted);
+      const proof = state.proofs.at(-1);
+      const ready = ctx && proof && options.isEngineeringReady?.(ctx, proof) ? proof : undefined;
+      latest = projectVisualContext(event.messages, state.images, script, options.workspace, state.proofs, state.selections, trusted, ready);
       releasedImages = imageCount(event.messages) - imageCount(latest);
       const lastReply = event.messages.findLastIndex((message) => message.role === "assistant");
       lastNew = imageCount(event.messages.slice(lastReply + 1));
@@ -306,7 +317,8 @@ export function createVisualRuntime(options: { workspace: string; projectRoot: s
   };
   const beforeCompact = async (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
     const branch = event.branchEntries.filter((entry) => entry.type === "message").map((entry) => entry.message);
-    const projected = (await context({ type: "context", messages: branch }))?.messages ?? branch;
+    const branchContext = { ...ctx, sessionManager: { ...ctx.sessionManager, getBranch: () => event.branchEntries } } as ExtensionContext;
+    const projected = (await context({ type: "context", messages: branch }, branchContext))?.messages ?? branch;
     const discarded = new Set([...event.preparation.messagesToSummarize, ...event.preparation.turnPrefixMessages]
       .filter((message) => message.role === "toolResult").map((message) => message.toolCallId));
     const unsafe = projected.some((message) => message.role === "toolResult" && discarded.has(message.toolCallId)

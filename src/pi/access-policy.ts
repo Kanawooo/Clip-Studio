@@ -1,18 +1,41 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionContext, InlineExtension, SessionManager, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import {
   effectivePath, pathInside, resolveTaskPaths, sameFilePath,
   type TaskPathOptions, type TaskPaths,
 } from "./task-paths.js";
-import { createVisualRuntime } from "./visual-context.js";
+import { createVisualRuntime, type VisualProof } from "./visual-context.js";
 
 export interface TaskAccessPolicyOptions extends TaskPathOptions {
   onTermination?: (reason: string) => void;
 }
 
 const BATCH_MARKER = "clip-composition-batch";
+/** Conservative readiness only, not an authoring validator. Unknown structures
+ * retain real images. Native source/range/timeline identity must match the plan. */
+function compositionMatchesPlan(html: string, output: { duration?: number; shots?: Array<{ source: string; start: number; end: number; at?: number; rate?: number }> }, resolve: (source: string) => string) {
+  const attr = (tag: string, name: string) => tag.match(new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, "i"))?.[2]
+    ?.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'");
+  const root = html.match(/<[a-z][^>]*\bdata-composition-id\s*=[^>]*>/i)?.[0];
+  if (!root || !Array.isArray(output.shots) || !(Number(output.duration) > 0)
+    || Math.abs(Number(attr(root, "data-duration")) - Number(output.duration)) > 0.12) return false;
+  const videos = [...html.matchAll(/<video\b[^>]*>/gi)].map(match => match[0]);
+  if (videos.length !== output.shots.length) return false;
+  let end = 0;
+  return output.shots.every((shot, index) => {
+    const tag = videos[index]!, src = attr(tag, "src"), from = shot.start, rate = shot.rate ?? 1;
+    const start = shot.at ?? end, duration = (shot.end - from) / rate;
+    end = Math.max(end, start + duration);
+    return !!src && typeof shot.source === "string" && duration > 0 && resolve(src) === resolve(shot.source)
+      && Math.abs(Number(attr(tag, "data-start")) - start) < 0.12
+      && Math.abs(Number(attr(tag, "data-duration")) - duration) < 0.12
+      && Math.abs(Number(attr(tag, "data-media-start") ?? 0) - from) < 0.12
+      && Math.abs(Number(attr(tag, "data-playback-rate") ?? 1) - rate) < 0.01;
+  });
+}
 interface CompositionReceipt { toolCallId: string; kind: "writer" | "edit"; files: Array<{ file: string; sha256: string }> }
 
 /** Native custom entries never participate in the model context. Legacy Sessions stay unmarked. */
@@ -70,7 +93,7 @@ export function createCompositionBatchGuard(options: TaskAccessPolicyOptions) {
     }
     return [];
   }
-  function history(ctx: ExtensionContext) {
+  function history(ctx: ExtensionContext, includeNativeWrites = false) {
     const entries = ctx.sessionManager.getBranch();
     const messages = entries.filter((entry) => entry.type === "message").map((entry) => entry.message);
     const tools = new Map<string, { name: string; arguments: Record<string, unknown> }>();
@@ -97,7 +120,18 @@ export function createCompositionBatchGuard(options: TaskAccessPolicyOptions) {
         for (const item of receipt.files) if (sameFilePath(item.file, target) && proven.has(target)) proven.set(target, item.sha256);
       }
     }
-    return { entries, proven };
+    // Legacy/single-output Sessions have native writes but no batch receipts.
+    // Only an actual paired successful write with the current exact bytes counts.
+    for (const [id, call] of includeNativeWrites ? tools : []) {
+      if (call.name !== "write" || results.get(id)?.isError !== false
+        || typeof call.arguments.path !== "string" || typeof call.arguments.content !== "string") continue;
+      const file = effectivePath(path.resolve(workspace, call.arguments.path));
+      try {
+        const hash = createHash("sha256").update(call.arguments.content).digest("hex");
+        if (pathInside(workspace, file) && digest(file) === hash) proven.set(file, hash);
+      } catch { /* Missing/changed engineering is not ready. */ }
+    }
+    return { entries, proven, tools, results };
   }
   function before(event: ToolCallEvent, ctx: ExtensionContext): ToolCallEventResult | undefined {
     if (event.toolName !== "bash") return;
@@ -150,7 +184,53 @@ export function createCompositionBatchGuard(options: TaskAccessPolicyOptions) {
       if (history(ctx).proven.has(file)) append({ kind: "edit", toolCallId: event.toolCallId, files: [{ file, sha256: digest(file) }] });
     }
   }
-  return { before, after };
+  function isReady(ctx: ExtensionContext, proof: VisualProof): boolean {
+    if (!proof.finalized || !pathInside(workspace, effectivePath(proof.file))) return false;
+    try {
+      const { proven, tools, results } = history(ctx, true);
+      const plan = JSON.parse(readFileSync(proof.file, "utf8"));
+      if (digest(proof.file) !== proof.sha256 || !Array.isArray(plan.outputs) || !plan.outputs.length) return false;
+      const contract = JSON.parse(readFileSync(path.join(workspace, "..", "delivery", "contract.json"), "utf8"));
+      if (contract.taskId !== proof.taskId || plan.outputs.length !== contract.slots.length) return false;
+      const candidates = new Set<string>();
+      for (const [id, call] of tools) {
+        if (!results.has(id)) continue;
+        if (call.name === "bash") for (const run of calls(call.arguments.command, queue, "run")) candidates.add(run.manifest);
+        if (call.name === "write" && results.get(id)?.isError === false && typeof call.arguments.path === "string") {
+          const file = effectivePath(path.resolve(workspace, call.arguments.path));
+          if (proven.has(file)) candidates.add(file);
+        }
+      }
+      type AudioSegment = { source?: string; from?: number; to?: number; at?: number; rate?: number };
+      const audio = (value: (AudioSegment & { segments?: AudioSegment[] }) | undefined, root: string) => {
+        const segments = value?.segments ?? (value?.source ? [value] : []);
+        return JSON.stringify(segments.map((segment) => ({ source: effectivePath(path.resolve(root, segment.source!)),
+          from: segment.from ?? 0, to: segment.to ?? null, at: segment.at ?? null, rate: segment.rate ?? 1 })));
+      };
+      for (const file of candidates) {
+        if (!pathInside(workspace, effectivePath(file))) continue;
+        let manifest;
+        try { manifest = JSON.parse(readFileSync(file, "utf8")); } catch { continue; }
+        if (manifest.version !== 1 || typeof manifest.project !== "string" || !Array.isArray(manifest.rows)
+          || manifest.rows.length !== plan.outputs.length) continue;
+        const project = effectivePath(path.resolve(workspace, manifest.project));
+        if (!pathInside(workspace, project)) continue;
+        const ready = manifest.rows.every((row: { output?: string; composition?: string; mainAudio?: Parameters<typeof audio>[0]; silentDuration?: number }, index: number) => {
+          const selected = plan.outputs[index];
+          if (row.output !== contract.slots[index] || selected.output !== row.output || typeof row.composition !== "string") return false;
+          const target = effectivePath(path.resolve(project, row.composition));
+          if (!pathInside(workspace, target) || proven.get(target) !== digest(target)) return false;
+          if (!compositionMatchesPlan(readFileSync(target, "utf8"), selected,
+            (source: string) => effectivePath(source.startsWith("file://") ? fileURLToPath(source) : path.resolve(project, source)))) return false;
+          if (row.silentDuration !== undefined) return row.silentDuration === selected.silentDuration;
+          return !!row.mainAudio && !!selected.mainAudio && audio(row.mainAudio, project) === audio(selected.mainAudio, workspace);
+        });
+        if (ready) return true;
+      }
+    } catch { /* Fail closed: retain real images on stale/unproven engineering. */ }
+    return false;
+  }
+  return { before, after, isReady };
 }
 
 interface Boundary extends TaskPaths {
@@ -182,8 +262,8 @@ const ALIAS_GROUPS = [["--project", "--dir", "-d"], ["--output", "--out", "-o"],
 export function createTaskAccessPolicy(options: TaskAccessPolicyOptions): InlineExtension {
   const handler = createTaskAccessHandler(options);
   const failure = createRenderFailureHandler(options);
-  const visual = createVisualRuntime(options);
   const batch = createCompositionBatchGuard(options);
+  const visual = createVisualRuntime({ ...options, isEngineeringReady: batch.isReady });
   return { name: "task-access-policy", hidden: true, factory: (pi) => {
     pi.on("context", visual.context);
     pi.on("context_with_system", visual.contextWithSystem);
@@ -653,6 +733,9 @@ export function createRenderFailureHandler(options: TaskAccessPolicyOptions) {
     if (!snapshot) return undefined;
     if (!event.isError) { failures.clear(); return undefined; }
     const text = event.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+    if (text.includes("[RENDER_EXHAUSTED]")) {
+      return `制作失败：${text.match(/\[RENDER_EXHAUSTED\][^\r\n]*/)?.[0] ?? "相同工程的自动恢复额度已用完"}`;
+    }
     const message = text.match(/render-queue:\s*(\[VALIDATION:[A-Z_]+\][^\r\n]*)/)?.[1];
     if (!message) return undefined;
     const code = message.match(/^\[VALIDATION:([A-Z_]+)\]/)?.[1] ?? "";
