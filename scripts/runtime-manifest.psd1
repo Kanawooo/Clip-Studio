@@ -10,6 +10,9 @@
   FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
   FfmpegReleaseApi = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
   FfmpegAssetName = "ffmpeg-master-latest-win64-gpl-shared.zip"
+  FfmpegAcceleratorUrls = @(
+    "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+  )
 
   GitVersion = "2.55.0.5"
   GitUrl = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/PortableGit-2.55.0.5-64-bit.7z.exe"
@@ -18,12 +21,24 @@
 
   UvVersion = "0.12.5"
   UvUrl = "https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-pc-windows-msvc.zip"
+  UvAcceleratorUrls = @(
+    "https://gh-proxy.com/https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-pc-windows-msvc.zip"
+    "https://ghfast.top/https://github.com/astral-sh/uv/releases/download/0.12.5/uv-x86_64-pc-windows-msvc.zip"
+  )
   UvSha256 = "4c4d49d8738847d9b71ba319e49a5688c93eac0fe6204b1df24e98528dddf39a"
 
   PythonVersion = "3.12.12"
+  PythonInstallOfficialUrl = "https://github.com/astral-sh/python-build-standalone/releases/download"
+  PythonInstallAcceleratorUrls = @(
+    "https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download"
+  )
 
   WhisperVersion = "b4938"
   WhisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip"
+  WhisperAcceleratorUrls = @(
+    "https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip"
+    "https://ghfast.top/https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip"
+  )
   WhisperSha256 = "c2a4b60edb11f7e11a9191ffb50929535527d4d91c9903dbe3e554583bbbc63d"
   WhisperModel = "small.en"
   WhisperModelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en.bin"

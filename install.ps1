@@ -167,23 +167,53 @@ function Test-SystemPython([string]$Path) {
   } catch { return $false }
 }
 
+function Get-RuntimeDownloadSources {
+  param(
+    [string]$OfficialUri,
+    [string[]]$MirrorUris = @(),
+    [string[]]$AcceleratorUris = @()
+  )
+  if ([string]::IsNullOrWhiteSpace($OfficialUri)) { throw "Official download source is missing" }
+  $official = $OfficialUri.Trim()
+  $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  [void]$seen.Add($official)
+  $candidates = @(
+    foreach ($uri in $MirrorUris) { [pscustomobject]@{ Kind = "mirror"; Uri = $uri } }
+    foreach ($uri in $AcceleratorUris) { [pscustomobject]@{ Kind = "accelerator"; Uri = $uri } }
+  )
+  $count = 0
+  foreach ($candidate in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($candidate.Uri)) { continue }
+    $uri = ([string]$candidate.Uri).Trim()
+    if (-not $seen.Add($uri)) { continue }
+    if (++$count -gt 2) { throw "A runtime may configure at most two mirror/accelerator sources" }
+    [pscustomobject]@{ Kind = $candidate.Kind; Uri = $uri; Attempts = 1; TimeoutSec = 600 }
+  }
+  [pscustomobject]@{ Kind = "official"; Uri = $official; Attempts = 2; TimeoutSec = 900 }
+}
+
 function Invoke-RuntimeDownload {
   param(
     [string]$Label,
     [string]$OfficialUri,
     [string]$MirrorUri,
+    [string[]]$AcceleratorUris = @(),
     [string]$OutFile,
     [string]$ExpectedSha256
   )
-  if (-not [string]::IsNullOrWhiteSpace($MirrorUri)) {
+  $failures = [Collections.Generic.List[string]]::new()
+  foreach ($source in @(Get-RuntimeDownloadSources -OfficialUri $OfficialUri -MirrorUris @($MirrorUri) -AcceleratorUris $AcceleratorUris)) {
+    $sourceLabel = "$($source.Kind) $(([uri]$source.Uri).DnsSafeHost)"
     try {
-      Invoke-ProjectDownload -Label "$Label (mirror)" -Uri $MirrorUri -OutFile $OutFile -ExpectedSha256 $ExpectedSha256 -AllowedRoot $ProjectRoot -Attempts 1 -TimeoutSec 600 | Out-Null
+      Invoke-ProjectDownload -Label "$Label ($sourceLabel)" -Uri $source.Uri -OutFile $OutFile -ExpectedSha256 $ExpectedSha256 -AllowedRoot $ProjectRoot -Attempts $source.Attempts -TimeoutSec $source.TimeoutSec | Out-Null
       return
     } catch {
-      Write-Host "[RETRY] $Label mirror unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+      $reason = [ClipStudio.Installer.RuntimeDownloader]::SafeMessage($_.Exception.Message)
+      $failures.Add("${sourceLabel}: $reason")
+      Write-Host "[RETRY] $Label $sourceLabel unavailable: $reason" -ForegroundColor Yellow
     }
   }
-  Invoke-ProjectDownload -Label $Label -Uri $OfficialUri -OutFile $OutFile -ExpectedSha256 $ExpectedSha256 -AllowedRoot $ProjectRoot | Out-Null
+  throw "$Label failed from all configured sources: $($failures -join '; ')"
 }
 
 function Replace-Directory([string]$Source, [string]$Destination) {
@@ -298,7 +328,7 @@ function Resolve-FfmpegRelease {
       "User-Agent" = "Clip-Studio-Installer/1.0"
     } -TimeoutSec 30 -ErrorAction Stop
   } catch {
-    throw "Unable to resolve the latest FFmpeg release: $($_.Exception.Message)"
+    throw "Unable to resolve the latest FFmpeg release: $([ClipStudio.Installer.RuntimeDownloader]::SafeMessage($_.Exception.Message))"
   }
 
   $asset = @($release.assets | Where-Object { [string]$_.name -eq $assetName }) | Select-Object -First 1
@@ -359,7 +389,7 @@ function Install-FfmpegRuntime {
   $release = Resolve-FfmpegRelease
   Write-Step "Using FFmpeg release $($release.Release)"
   $download = Join-Path $StagingRoot "ffmpeg.zip"
-  Invoke-ProjectDownload -Label "FFmpeg latest x64" -Uri $Manifest.FfmpegUrl -OutFile $download -ExpectedSha256 $release.Sha256 -AllowedRoot $ProjectRoot | Out-Null
+  Invoke-RuntimeDownload -Label "FFmpeg latest x64" -OfficialUri $Manifest.FfmpegUrl -AcceleratorUris $Manifest.FfmpegAcceleratorUrls -OutFile $download -ExpectedSha256 $release.Sha256
   $expanded = Join-Path $StagingRoot "ffmpeg-expanded"
   Expand-Archive -LiteralPath $download -DestinationPath $expanded -Force
   $ffmpegSource = Get-ChildItem -LiteralPath $expanded -Filter ffmpeg.exe -Recurse -File | Select-Object -First 1
@@ -459,7 +489,7 @@ function Install-UvRuntime {
   }
 
   $download = Join-Path $StagingRoot "uv.zip"
-  Invoke-ProjectDownload -Label "uv $($Manifest.UvVersion) x64" -Uri $Manifest.UvUrl -OutFile $download -ExpectedSha256 $Manifest.UvSha256 -AllowedRoot $ProjectRoot | Out-Null
+  Invoke-RuntimeDownload -Label "uv $($Manifest.UvVersion) x64" -OfficialUri $Manifest.UvUrl -AcceleratorUris $Manifest.UvAcceleratorUrls -OutFile $download -ExpectedSha256 $Manifest.UvSha256
   $expanded = Join-Path $StagingRoot "uv-expanded"
   Expand-Archive -LiteralPath $download -DestinationPath $expanded -Force
   $uvSource = Get-ChildItem -LiteralPath $expanded -Filter uv.exe -Recurse -File | Select-Object -First 1
@@ -541,6 +571,75 @@ function Find-SystemPython {
   return $null
 }
 
+function Invoke-UvPythonInstallAttempt {
+  param([int]$TimeoutSec, [string]$SourceUri)
+  $logPrefix = Join-Path $StagingRoot ("python-install-" + [Guid]::NewGuid().ToString("N"))
+  $stdout = "$logPrefix.stdout"
+  $stderr = "$logPrefix.stderr"
+  $process = $null
+  try {
+    $process = Start-Process -FilePath $UvExe -ArgumentList @("python", "install", $Manifest.PythonVersion, "--default", "--no-registry", "--mirror", $SourceUri) -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Cache the handle before waiting: Windows PowerShell 5.1 otherwise exposes
+    # a null ExitCode for an already-exited Start-Process -PassThru process.
+    $null = $process.Handle
+    if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+      $process.Kill()
+      if (-not $process.WaitForExit(10000)) { throw "Unable to stop the timed-out uv Python installer" }
+      throw "uv Python installation exceeded its $TimeoutSec second process budget"
+    }
+    if ($process.ExitCode -ne 0) {
+      $details = @(
+        foreach ($log in @($stderr, $stdout)) {
+          if (Test-Path -LiteralPath $log -PathType Leaf) { Get-Content -LiteralPath $log -Tail 12 }
+        }
+      ) -join ' '
+      throw "uv Python installation exited $($process.ExitCode): $([ClipStudio.Installer.RuntimeDownloader]::SafeMessage($details))"
+    }
+  } finally {
+    if ($process) {
+      if (-not $process.HasExited) {
+        $process.Kill()
+        if (-not $process.WaitForExit(10000)) { throw "Unable to stop the uv Python installer" }
+      }
+      $process.Dispose()
+    }
+    foreach ($log in @($stdout, $stderr)) {
+      if (Test-Path -LiteralPath $log -PathType Leaf) { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
+    }
+  }
+}
+
+function Install-ManagedPython {
+  $variables = @("UV_PYTHON_INSTALL_MIRROR", "UV_HTTP_CONNECT_TIMEOUT", "UV_HTTP_TIMEOUT", "UV_HTTP_RETRIES")
+  $original = @{}
+  foreach ($name in $variables) { $original[$name] = [Environment]::GetEnvironmentVariable($name, "Process") }
+  $failures = [Collections.Generic.List[string]]::new()
+  try {
+    # uv 0.12.5 uses per-read (not whole-request) timeout. Its native downloader
+    # remains separate from the C# stream watchdog and from PyPI package indexes.
+    $env:UV_HTTP_CONNECT_TIMEOUT = "20"
+    $env:UV_HTTP_TIMEOUT = "45"
+    foreach ($source in @(Get-RuntimeDownloadSources -OfficialUri $Manifest.PythonInstallOfficialUrl -AcceleratorUris $Manifest.PythonInstallAcceleratorUrls)) {
+      $sourceLabel = "$($source.Kind) $(([uri]$source.Uri).DnsSafeHost)"
+      $env:UV_PYTHON_INSTALL_MIRROR = $source.Uri
+      $env:UV_HTTP_RETRIES = [string]($source.Attempts - 1)
+      Write-Step "Installing CPython $($Manifest.PythonVersion) from $sourceLabel"
+      try {
+        # Allow the healthy transfer budget plus extraction/publication time.
+        Invoke-UvPythonInstallAttempt -TimeoutSec ($source.TimeoutSec + 60) -SourceUri $source.Uri
+        return
+      } catch {
+        $reason = [ClipStudio.Installer.RuntimeDownloader]::SafeMessage($_.Exception.Message)
+        $failures.Add("${sourceLabel}: $reason")
+        Write-Host "[RETRY] CPython $sourceLabel unavailable: $reason" -ForegroundColor Yellow
+      }
+    }
+    throw "Project Python installation failed from all configured sources: $($failures -join '; ')"
+  } finally {
+    foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name, $original[$name], "Process") }
+  }
+}
+
 function Install-PythonRuntime {
   $requirementsHash = Get-Sha256 $PythonRequirements
   $recordedBase = if ($ExistingState -and $ExistingState.runtimeFiles -and $ExistingState.runtimeFiles.pythonBase) {
@@ -559,8 +658,7 @@ function Install-PythonRuntime {
     Write-Step "Reusing system CPython $((& $basePython --version).Trim())"
   } else {
     Write-Step "Installing project Python $($Manifest.PythonVersion)"
-    & $UvExe python install $Manifest.PythonVersion --default --no-registry
-    if ($LASTEXITCODE -ne 0) { throw "Project Python installation failed with exit code $LASTEXITCODE" }
+    Install-ManagedPython
     $pythonPathOutput = & $UvExe python find $Manifest.PythonVersion --managed-python
     if ($LASTEXITCODE -ne 0) { throw "Unable to locate the project Python runtime" }
     $basePython = ($pythonPathOutput | Select-Object -Last 1).Trim()
@@ -612,7 +710,7 @@ function Install-WhisperRuntime {
   }
 
   $download = Join-Path $StagingRoot "whisper.zip"
-  Invoke-ProjectDownload -Label "whisper.cpp $($Manifest.WhisperVersion) x64" -Uri $Manifest.WhisperUrl -OutFile $download -ExpectedSha256 $Manifest.WhisperSha256 -AllowedRoot $ProjectRoot | Out-Null
+  Invoke-RuntimeDownload -Label "whisper.cpp $($Manifest.WhisperVersion) x64" -OfficialUri $Manifest.WhisperUrl -AcceleratorUris $Manifest.WhisperAcceleratorUrls -OutFile $download -ExpectedSha256 $Manifest.WhisperSha256
   $expanded = Join-Path $StagingRoot "whisper-expanded"
   Expand-Archive -LiteralPath $download -DestinationPath $expanded -Force
   $whisperSource = Get-ChildItem -LiteralPath $expanded -Filter whisper-cli.exe -Recurse -File | Select-Object -First 1

@@ -10,6 +10,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -52,6 +53,69 @@ namespace ClipStudio.Installer
         }
     }
 
+    // One budget owns every request in a complete attempt, including segment retries.
+    internal sealed class TransferBudget : IDisposable
+    {
+        private readonly object _gate = new object();
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly int _totalSeconds;
+        private readonly int _idleSeconds;
+        private readonly Timer _watchdog;
+        private long _lastProgress;
+        private int _activeBodies;
+        private string _failure;
+        public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
+
+        public TransferBudget(int totalSeconds, int idleSeconds)
+        {
+            _totalSeconds = totalSeconds;
+            _idleSeconds = idleSeconds;
+            _watchdog = new Timer(Check, null, 100, 100);
+        }
+
+        public string Failure { get { lock (_gate) { return _failure; } } }
+
+        public void BeginBody()
+        {
+            lock (_gate)
+            {
+                if (_activeBodies++ == 0) _lastProgress = _clock.ElapsedMilliseconds;
+            }
+        }
+
+        public void Progress()
+        {
+            lock (_gate) { _lastProgress = _clock.ElapsedMilliseconds; }
+        }
+
+        public void EndBody() { lock (_gate) { _activeBodies--; } }
+
+        private void Check(object state)
+        {
+            bool cancel = false;
+            lock (_gate)
+            {
+                if (_failure != null) return;
+                if (_clock.Elapsed.TotalSeconds >= _totalSeconds)
+                    _failure = "Complete transfer exceeded " + _totalSeconds + " seconds.";
+                else if (_activeBodies > 0 && _clock.ElapsedMilliseconds - _lastProgress >= _idleSeconds * 1000L)
+                    _failure = "Response body stalled: no new bytes for " + _idleSeconds + " seconds.";
+                cancel = _failure != null;
+            }
+            if (cancel) Cancellation.Cancel();
+        }
+
+        public void Dispose()
+        {
+            // Wait for the timer callback before disposing its cancellation source.
+            using (var stopped = new ManualResetEvent(false))
+            {
+                if (_watchdog.Dispose(stopped)) stopped.WaitOne();
+            }
+            Cancellation.Dispose();
+        }
+    }
+
     internal sealed class RangeNotSupportedException : Exception
     {
         public RangeNotSupportedException(string message) : base(message) { }
@@ -61,6 +125,13 @@ namespace ClipStudio.Installer
     {
         public long Start { get; set; }
         public long End { get; set; }
+    }
+
+    internal sealed class SegmentFailure
+    {
+        private Exception _cause;
+        public Exception Cause { get { return _cause; } }
+        public void Record(Exception error) { Interlocked.CompareExchange(ref _cause, error, null); }
     }
 
     internal sealed class ConsoleProgress
@@ -196,8 +267,7 @@ namespace ClipStudio.Installer
         private static string SafeMessage(string message)
         {
             if (String.IsNullOrWhiteSpace(message)) return "download failed";
-            string oneLine = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
-            return oneLine.Length <= 180 ? oneLine : oneLine.Substring(0, 180) + "...";
+            return RuntimeDownloader.SafeMessage(message);
         }
     }
 
@@ -214,6 +284,8 @@ namespace ClipStudio.Installer
             int requestedConnections,
             long segmentThresholdBytes,
             int timeoutSeconds,
+            int headerTimeoutSeconds,
+            int noProgressTimeoutSeconds,
             int attempts,
             bool forceProgress)
         {
@@ -222,6 +294,8 @@ namespace ClipStudio.Installer
             if (String.IsNullOrWhiteSpace(label)) throw new ArgumentException("Download label is required.", "label");
             if (requestedConnections < 1 || requestedConnections > 32) throw new ArgumentOutOfRangeException("requestedConnections");
             if (attempts < 1 || attempts > 5) throw new ArgumentOutOfRangeException("attempts");
+            if (timeoutSeconds < 1 || headerTimeoutSeconds < 1 || noProgressTimeoutSeconds < 1) throw new ArgumentOutOfRangeException("timeoutSeconds");
+            if (!String.IsNullOrWhiteSpace(expectedSha256) && !Regex.IsMatch(expectedSha256, "^[0-9a-fA-F]{64}$")) throw new ArgumentException("Expected SHA-256 is invalid.");
 
             string fullOutputPath = Path.GetFullPath(outputPath);
             Directory.CreateDirectory(Path.GetDirectoryName(fullOutputPath));
@@ -230,16 +304,19 @@ namespace ClipStudio.Installer
 
             for (int attempt = 1; attempt <= attempts; attempt++)
             {
+                string temporaryPath = fullOutputPath + ".download-" + Guid.NewGuid().ToString("N");
                 progress.Start();
                 try
                 {
                     TransferResult transfer = DownloadAttempt(
                         uri,
-                        fullOutputPath,
+                        temporaryPath,
                         progress,
                         requestedConnections,
                         segmentThresholdBytes,
-                        timeoutSeconds);
+                        timeoutSeconds,
+                        headerTimeoutSeconds,
+                        noProgressTimeoutSeconds);
 
                     progress.Verify(!String.IsNullOrWhiteSpace(expectedSha256));
                     if (!String.IsNullOrWhiteSpace(expectedSha256))
@@ -251,8 +328,8 @@ namespace ClipStudio.Installer
                         }
                     }
 
-                    if (File.Exists(fullOutputPath)) File.Delete(fullOutputPath);
-                    File.Move(transfer.TemporaryPath, fullOutputPath);
+                    if (File.Exists(fullOutputPath)) File.Replace(transfer.TemporaryPath, fullOutputPath, null);
+                    else File.Move(transfer.TemporaryPath, fullOutputPath);
                     progress.Complete(transfer.Bytes, transfer.Seconds, transfer.Connections);
                     return new DownloadResult
                     {
@@ -264,38 +341,44 @@ namespace ClipStudio.Installer
                 catch (Exception error)
                 {
                     lastError = Unwrap(error);
-                    CleanupTemporaryFiles(fullOutputPath);
                     if (attempt < attempts)
                     {
                         progress.Retry(attempt + 1, lastError.Message);
                         Thread.Sleep(1000);
                     }
                 }
+                finally
+                {
+                    // Never enumerate another attempt's temporary files.
+                    TryDelete(temporaryPath);
+                }
             }
 
             progress.Fail(lastError == null ? "download failed" : lastError.Message);
-            throw new InvalidOperationException("Download failed for " + label + ": " + (lastError == null ? "unknown error" : lastError.Message), lastError);
+            throw new InvalidOperationException("Download failed for " + SafeMessage(label) + ": " + SafeMessage(ErrorText(lastError)));
         }
 
         private static TransferResult DownloadAttempt(
             string uri,
-            string outputPath,
+            string temporaryPath,
             ConsoleProgress progress,
             int requestedConnections,
             long segmentThresholdBytes,
-            int timeoutSeconds)
+            int timeoutSeconds,
+            int headerTimeoutSeconds,
+            int noProgressTimeoutSeconds)
         {
-            string token = Guid.NewGuid().ToString("N");
-            string temporaryPath = outputPath + ".download-" + token;
             var stopwatch = new Stopwatch();
 
             using (var handler = CreateHandler(requestedConnections))
             using (var client = new HttpClient(handler))
-            using (var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+            using (var budget = new TransferBudget(timeoutSeconds, noProgressTimeoutSeconds))
             {
                 client.Timeout = Timeout.InfiniteTimeSpan;
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("Clip-Studio-Installer/1.0");
-                ProbeResult probe = Probe(client, uri, cancellation.Token);
+                try
+                {
+                ProbeResult probe = Probe(client, uri, budget, headerTimeoutSeconds);
                 string downloadUri = String.IsNullOrWhiteSpace(probe.EffectiveUri) ? uri : probe.EffectiveUri;
 
                 int connections = 1;
@@ -310,23 +393,23 @@ namespace ClipStudio.Installer
                     stopwatch.Start();
                     try
                     {
-                        using (var segmentCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token))
+                        using (var segmentCancellation = CancellationTokenSource.CreateLinkedTokenSource(budget.Cancellation.Token))
                         {
-                            DownloadSegmented(client, downloadUri, temporaryPath, token, probe.TotalBytes, connections, progress, segmentCancellation);
+                            DownloadSegmented(client, downloadUri, temporaryPath, probe.TotalBytes, connections, progress, segmentCancellation, budget, headerTimeoutSeconds);
                         }
                     }
                     catch (RangeNotSupportedException)
                     {
-                        CleanupTemporaryFiles(outputPath);
+                        TryDelete(temporaryPath);
                         connections = 1;
                         stopwatch.Restart();
-                        DownloadSingle(client, downloadUri, temporaryPath, probe.TotalBytes, progress, cancellation.Token);
+                        DownloadSingle(client, downloadUri, temporaryPath, probe.TotalBytes, progress, budget, headerTimeoutSeconds);
                     }
                 }
                 else
                 {
                     stopwatch.Start();
-                    DownloadSingle(client, downloadUri, temporaryPath, probe.TotalBytes, progress, cancellation.Token);
+                    DownloadSingle(client, downloadUri, temporaryPath, probe.TotalBytes, progress, budget, headerTimeoutSeconds);
                 }
 
                 stopwatch.Stop();
@@ -343,6 +426,12 @@ namespace ClipStudio.Installer
                     Seconds = Math.Max(0.001, stopwatch.Elapsed.TotalSeconds),
                     Connections = connections
                 };
+                }
+                catch (Exception)
+                {
+                    if (budget.Failure != null) throw new TimeoutException(budget.Failure);
+                    throw;
+                }
             }
         }
 
@@ -361,12 +450,12 @@ namespace ClipStudio.Installer
             return handler;
         }
 
-        private static ProbeResult Probe(HttpClient client, string uri, CancellationToken token)
+        private static ProbeResult Probe(HttpClient client, string uri, TransferBudget budget, int headerTimeoutSeconds)
         {
             using (var request = CreateRequest(uri))
             {
                 request.Headers.Range = new RangeHeaderValue(0, 0);
-                using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).GetAwaiter().GetResult())
+                using (HttpResponseMessage response = SendHeaders(client, request, budget.Cancellation.Token, headerTimeoutSeconds, "Range probe").GetAwaiter().GetResult())
                 {
                     if (response.StatusCode == HttpStatusCode.PartialContent)
                     {
@@ -385,7 +474,9 @@ namespace ClipStudio.Installer
                     response.EnsureSuccessStatusCode();
                     return new ProbeResult
                     {
-                        TotalBytes = response.Content.Headers.ContentLength ?? -1,
+                        // A malformed 206 describes only a partial body. The full
+                        // single-stream response must supply its own size authority.
+                        TotalBytes = response.StatusCode == HttpStatusCode.PartialContent ? -1 : response.Content.Headers.ContentLength ?? -1,
                         SupportsRanges = false,
                         EffectiveUri = response.RequestMessage.RequestUri.AbsoluteUri
                     };
@@ -399,14 +490,22 @@ namespace ClipStudio.Installer
             string temporaryPath,
             long probedTotal,
             ConsoleProgress progress,
-            CancellationToken token)
+            TransferBudget budget,
+            int headerTimeoutSeconds)
         {
+            CancellationToken token = budget.Cancellation.Token;
             using (var request = CreateRequest(uri))
-            using (HttpResponseMessage response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).GetAwaiter().GetResult())
+            using (HttpResponseMessage response = SendHeaders(client, request, token, headerTimeoutSeconds, "File request").GetAwaiter().GetResult())
             {
                 response.EnsureSuccessStatusCode();
                 long total = response.Content.Headers.ContentLength ?? probedTotal;
                 long downloaded = 0;
+                budget.BeginBody();
+                try
+                {
+                // .NET Framework streams may ignore read cancellation; disposing the response
+                // closes the underlying request and releases a pending read on PowerShell 5.1.
+                using (token.Register(response.Dispose))
                 using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
                 using (var output = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None, BufferSize, FileOptions.SequentialScan))
                 {
@@ -415,6 +514,9 @@ namespace ClipStudio.Installer
                     {
                         int read = input.ReadAsync(buffer, 0, buffer.Length, token).GetAwaiter().GetResult();
                         if (read == 0) break;
+                        token.ThrowIfCancellationRequested();
+                        budget.Progress();
+                        if (total > 0 && downloaded + read > total) throw new InvalidDataException("Response body exceeded the expected file size.");
                         output.Write(buffer, 0, read);
                         downloaded += read;
                         progress.Update(downloaded, total, 1, false);
@@ -422,6 +524,8 @@ namespace ClipStudio.Installer
                     output.Flush(true);
                 }
                 if (total > 0 && downloaded != total) throw new InvalidDataException("The server closed the download before all bytes were received.");
+                }
+                finally { budget.EndBody(); }
             }
         }
 
@@ -429,11 +533,12 @@ namespace ClipStudio.Installer
             HttpClient client,
             string uri,
             string temporaryPath,
-            string token,
             long total,
             int connections,
             ConsoleProgress progress,
-            CancellationTokenSource cancellation)
+            CancellationTokenSource cancellation,
+            TransferBudget budget,
+            int headerTimeoutSeconds)
         {
             var counter = new ProgressCounter();
             int targetChunks = connections * 8;
@@ -456,9 +561,10 @@ namespace ClipStudio.Installer
 
             int workerCount = Math.Min(connections, chunkCount);
             var tasks = new Task[workerCount];
+            var failure = new SegmentFailure();
             for (int index = 0; index < workerCount; index++)
             {
-                tasks[index] = DownloadSegmentWorker(client, uri, temporaryPath, total, pending, counter, cancellation.Token);
+                tasks[index] = DownloadSegmentWorker(client, uri, temporaryPath, total, pending, counter, cancellation, budget, headerTimeoutSeconds, failure);
             }
 
             Task all = Task.WhenAll(tasks);
@@ -474,6 +580,12 @@ namespace ClipStudio.Installer
                 all.GetAwaiter().GetResult();
                 progress.Update(total, total, connections, true);
             }
+            catch
+            {
+                // Cancellation of peers must not hide the original HTTP/range/IO failure.
+                if (failure.Cause != null) throw failure.Cause;
+                throw;
+            }
             finally
             {
                 if (!all.IsCompleted || all.IsFaulted || all.IsCanceled) cancellation.Cancel();
@@ -487,13 +599,26 @@ namespace ClipStudio.Installer
             long total,
             ConcurrentQueue<SegmentRange> pending,
             ProgressCounter counter,
-            CancellationToken token)
+            CancellationTokenSource cancellation,
+            TransferBudget budget,
+            int headerTimeoutSeconds,
+            SegmentFailure failure)
         {
+            CancellationToken token = cancellation.Token;
+            try
+            {
             SegmentRange range;
             while (pending.TryDequeue(out range))
             {
                 token.ThrowIfCancellationRequested();
-                await DownloadSegmentWithRetry(client, uri, outputPath, range.Start, range.End, total, counter, token).ConfigureAwait(false);
+                await DownloadSegmentWithRetry(client, uri, outputPath, range.Start, range.End, total, counter, token, budget, headerTimeoutSeconds).ConfigureAwait(false);
+            }
+            }
+            catch (Exception error)
+            {
+                if (!token.IsCancellationRequested) failure.Record(error);
+                cancellation.Cancel();
+                throw;
             }
         }
 
@@ -505,15 +630,17 @@ namespace ClipStudio.Installer
             long end,
             long total,
             ProgressCounter counter,
-            CancellationToken token)
+            CancellationToken token,
+            TransferBudget budget,
+            int headerTimeoutSeconds)
         {
             Exception lastError = null;
             for (int attempt = 1; attempt <= 3; attempt++)
             {
                 try
                 {
-                    await DownloadSegment(client, uri, outputPath, start, end, total, token).ConfigureAwait(false);
-                    counter.Add((int)(end - start + 1));
+                    token.ThrowIfCancellationRequested();
+                    await DownloadSegment(client, uri, outputPath, start, end, total, counter, token, budget, headerTimeoutSeconds).ConfigureAwait(false);
                     return;
                 }
                 catch (RangeNotSupportedException)
@@ -522,11 +649,12 @@ namespace ClipStudio.Installer
                 }
                 catch (Exception error)
                 {
+                    token.ThrowIfCancellationRequested();
                     lastError = error;
                 }
                 if (attempt < 3) await Task.Delay(attempt * 250, token).ConfigureAwait(false);
             }
-            throw new InvalidDataException("A download segment failed after three attempts.", lastError);
+            throw new InvalidDataException("A download segment failed after three attempts: " + ErrorText(lastError), lastError);
         }
 
         private static async Task DownloadSegment(
@@ -536,13 +664,17 @@ namespace ClipStudio.Installer
             long start,
             long end,
             long total,
-            CancellationToken token)
+            ProgressCounter counter,
+            CancellationToken token,
+            TransferBudget budget,
+            int headerTimeoutSeconds)
         {
             using (var request = CreateRequest(uri))
             {
                 request.Headers.Range = new RangeHeaderValue(start, end);
-                using (HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false))
+                using (HttpResponseMessage response = await SendHeaders(client, request, token, headerTimeoutSeconds, "Segment request").ConfigureAwait(false))
                 {
+                    response.EnsureSuccessStatusCode();
                     if (response.StatusCode != HttpStatusCode.PartialContent)
                     {
                         throw new RangeNotSupportedException("The server did not honor the requested byte range.");
@@ -555,6 +687,10 @@ namespace ClipStudio.Installer
 
                     long expected = end - start + 1;
                     long written = 0;
+                    budget.BeginBody();
+                    try
+                    {
+                    using (token.Register(response.Dispose))
                     using (Stream input = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
                     using (var output = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite, BufferSize, true))
                     {
@@ -564,13 +700,60 @@ namespace ClipStudio.Installer
                         {
                             int read = await input.ReadAsync(buffer, 0, buffer.Length, token).ConfigureAwait(false);
                             if (read == 0) break;
+                            token.ThrowIfCancellationRequested();
+                            budget.Progress();
+                            counter.Add(read);
+                            if (written + read > expected) throw new InvalidDataException("Response body exceeded the requested byte range.");
                             await output.WriteAsync(buffer, 0, read, token).ConfigureAwait(false);
                             written += read;
                         }
                     }
                     if (written != expected) throw new InvalidDataException("A download segment ended before all bytes were received.");
+                    }
+                    finally { budget.EndBody(); }
                 }
             }
+        }
+
+        private static async Task<HttpResponseMessage> SendHeaders(HttpClient client, HttpRequestMessage request, CancellationToken token, int seconds, string stage)
+        {
+            using (var headerBudget = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                headerBudget.CancelAfter(TimeSpan.FromSeconds(seconds));
+                try
+                {
+                    return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerBudget.Token).ConfigureAwait(false);
+                }
+                catch (Exception error)
+                {
+                    if (!token.IsCancellationRequested && headerBudget.IsCancellationRequested)
+                        throw new TimeoutException(stage + " connection/response headers exceeded " + seconds + " seconds.");
+                    if (token.IsCancellationRequested) token.ThrowIfCancellationRequested();
+                    throw new HttpRequestException(stage + " failed: " + ErrorText(error), error);
+                }
+            }
+        }
+
+        public static string SafeMessage(string message)
+        {
+            if (String.IsNullOrWhiteSpace(message)) return "download failed";
+            string safe = Regex.Replace(message, @"https?://[^\s<>\""']+", delegate(Match match) {
+                Uri parsed;
+                if (!Uri.TryCreate(match.Value, UriKind.Absolute, out parsed)) return "[redacted URL]";
+                return parsed.GetLeftPart(UriPartial.Authority).Replace(parsed.UserInfo + "@", "") + parsed.AbsolutePath;
+            }, RegexOptions.IgnoreCase);
+            safe = Regex.Replace(safe, @"(?i)\b(?:Bearer\s+\S+|(?:token|password|api[_-]?key|authorization)\s*[:=]\s*\S+)", "[redacted]");
+            safe = Regex.Replace(safe, @"[\x00-\x1f\x7f]", " ").Trim();
+            return safe.Length <= 600 ? safe : safe.Substring(0, 600) + "...";
+        }
+
+        private static string ErrorText(Exception error)
+        {
+            if (error == null) return "unknown error";
+            string message = error.Message;
+            if (error.InnerException != null && message.IndexOf(error.InnerException.Message, StringComparison.Ordinal) < 0)
+                message += " " + ErrorText(error.InnerException);
+            return SafeMessage(message);
         }
 
         private static HttpRequestMessage CreateRequest(string uri)
@@ -598,17 +781,6 @@ namespace ClipStudio.Installer
                 if (flat.InnerExceptions.Count > 0) return Unwrap(flat.InnerExceptions[0]);
             }
             return error.InnerException != null && (error is System.Reflection.TargetInvocationException) ? Unwrap(error.InnerException) : error;
-        }
-
-        private static void CleanupTemporaryFiles(string outputPath)
-        {
-            string directory = Path.GetDirectoryName(outputPath);
-            string prefix = Path.GetFileName(outputPath) + ".download-";
-            if (!Directory.Exists(directory)) return;
-            foreach (string candidate in Directory.GetFiles(directory, prefix + "*"))
-            {
-                TryDelete(candidate);
-            }
         }
 
         private static void TryDelete(string path)
@@ -644,6 +816,8 @@ function Invoke-ProjectDownload {
     [int]$Connections = 16,
     [long]$SegmentThresholdBytes = 4MB,
     [int]$TimeoutSec = 900,
+    [int]$HeaderTimeoutSec = 20,
+    [int]$NoProgressTimeoutSec = 45,
     [int]$Attempts = 2,
     [string]$AllowedRoot = "",
     [switch]$ForceProgress
@@ -665,6 +839,8 @@ function Invoke-ProjectDownload {
     $Connections,
     $SegmentThresholdBytes,
     $TimeoutSec,
+    $HeaderTimeoutSec,
+    $NoProgressTimeoutSec,
     $Attempts,
     [bool]$ForceProgress
   )
